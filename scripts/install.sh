@@ -2,7 +2,7 @@
 # Install lazyamp from GitHub Releases.
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | sh
-#   VERSION=v0.1.0 curl -fsSL ... | sh
+#   curl -fsSL ... | VERSION=v0.1.0 sh
 #   sh install.sh --prefix /usr/local
 set -eu
 

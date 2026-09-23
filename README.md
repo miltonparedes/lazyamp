@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/
 Installs to `~/.local/bin`, or `/usr/local/bin` if writable. Pin a version or prefix:
 
 ```bash
-VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | VERSION=v0.1.0 sh
 curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | sh -s -- --prefix /usr/local
 ```
 
