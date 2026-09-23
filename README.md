@@ -59,22 +59,24 @@ lazyamp
 | Key | Action |
 | --- | --- |
 | `hjkl` / arrows | Move; `h`/`l` also switch panes |
-| `Tab` | Runners ↔ directories |
+| `Tab` | Runners ↔ served directories |
 | `Enter` | Confirm overlay / show selected path |
 | `q` / `Ctrl-c` | Quit |
 | `?` | Help overlay |
 | `Esc` | Close overlay |
-| `s` | Start `amp --no-tui` (directory picker) |
+| `s` | Start `amp --no-tui` (pick the process start cwd) |
 | `x` | Stop selected runner (confirms) |
 | `r` | Restart selected runner (confirms; uses that runner's launch spec) |
 | `g` | Refresh runner list |
-| `a` | Add a served directory |
-| `d` | Remove the selected directory (confirms) |
+| `a` | Add a served directory (`amp runner dirs add`) |
+| `d` | Remove the selected served directory (confirms) |
 | `f` | Common flags panel (saved to config) |
 | `u` | Run `amp update` |
 | `c` | Show config path |
 
-Directory picker: `/` or any non-`hjkl` key starts filter mode (typed text is shown; `hjkl` then insert as letters). Arrows always move. `Enter` selects the highlighted match. `Esc` clears the filter first, then closes. Recent paths, cwd, and home are listed first.
+Directory picker: `hjkl` browses immediate children of the current folder. `/` or any non-`hjkl` key starts filter mode (typed text is shown; `hjkl` then insert as letters). Filter searches nested directories under the browse root, plus recent dirs and `zoxide query -l` when `zoxide` is on `PATH` (zoxide matches are listed first). Heavy trees (`.git`, `node_modules`, `target`, …) are skipped and results are capped. The walk runs off the UI thread. Arrows always move. `Enter` selects the highlighted match. `Esc` clears the filter first, then closes.
+
+`s` chooses the runner's start cwd. `a` adds a served directory — a path the runner can see, which is not the same as the start cwd.
 
 The right pane shows the last lines of the selected runner's log (under `$XDG_STATE_HOME/lazyamp/logs/`). Amp CLI calls run off the UI thread; the status line shows `working…` while they run.
 
@@ -114,8 +116,9 @@ Runner logs, a spawn-PID registry (`spawned.json`), and per-runner launch specs 
 ## PID detection
 
 1. Parse a `pid` field from `amp runner list` (JSON keys `pid` / `processId`, or text like `pid 1234`). PIDs that are not a positive `i32` are ignored.
-2. If the list has no PIDs, scan this machine for `amp --no-tui` processes (Linux: `/proc/<pid>/cmdline` + `cwd`; other Unix: `ps`) and match on **runner-id or the exact PID**. Distinct runners that share a working directory are not merged.
-3. Runners started from lazyamp are also recorded in `~/.local/state/lazyamp/spawned.json`. Registry entries are kept only if the PID still looks like `amp --no-tui`.
+2. Scan this machine for `amp --no-tui` processes (Linux: `/proc/<pid>/cmdline` + `cwd` + parent PID; other Unix: `ps`). A binary named `amp` matches, and so does `node`/`bun`/`deno` running an Amp script. Processes are grouped by **runner-id and process tree** so wrapper/runtime children are one row, not three.
+3. Amp list identity wins. Local helper PIDs attach to that row. The stop/restart PID is the listed PID when it is in the group, otherwise the tree root. Distinct runner-ids that share a working directory are not merged.
+4. Runners started from lazyamp are also recorded in `~/.local/state/lazyamp/spawned.json`. Registry entries are kept only if the PID still looks like `amp --no-tui`.
 
 Stop signals **only the exact process PID** — never `kill(-pid)` / process-group broadcast. Before `SIGTERM`/`SIGKILL`, lazyamp verifies identity:
 
