@@ -1,17 +1,19 @@
 //! Amp CLI wrapper: argument builders, list parsers, and process control.
 
-use crate::config::state_dir;
-use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use crate::config::{atomic_write, state_dir};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Options used when spawning `amp --no-tui`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StartOptions {
     pub runner_id: Option<String>,
     pub mode: Option<String>,
@@ -23,6 +25,43 @@ pub struct StartOptions {
     pub extra_dirs: Vec<PathBuf>,
     pub discover_dirs: bool,
     pub amp_env: bool,
+}
+
+/// Persisted argv + cwd used to start a specific runner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchSpec {
+    pub runner_id: Option<String>,
+    pub cwd: PathBuf,
+    pub options: StartOptions,
+}
+
+/// Result of spawning `amp --no-tui` after a short liveness probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartOutcome {
+    pub pid: u32,
+    pub cwd: PathBuf,
+    pub log_path: PathBuf,
+    pub health: StartHealth,
+}
+
+/// How healthy a just-spawned runner looks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartHealth {
+    /// Present in `amp runner list`.
+    Listed,
+    /// Process is still alive; not yet listed and not obviously stuck on login.
+    Alive,
+    /// Log shows Amp waiting for an interactive login.
+    NeedsLogin,
+    /// Process exited during the probe window.
+    Exited { hint: String },
+}
+
+/// Result of a stop attempt after the process is gone (or was already gone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    Stopped,
+    AlreadyGone,
 }
 
 /// A runner discovered from `amp runner list` and/or local process scan.
@@ -136,19 +175,27 @@ impl AmpClient {
         self.run_ok_owned(&args)
     }
 
-    /// Spawn `amp --no-tui` in `cwd` and return the new PID.
-    pub fn start_runner(&self, cwd: &Path, opts: &StartOptions) -> Result<u32> {
+    /// Spawn `amp --no-tui` in `cwd` and probe whether it actually came up.
+    pub fn start_runner(&self, cwd: &Path, opts: &StartOptions) -> Result<StartOutcome> {
         if !cwd.is_dir() {
             bail!("working directory does not exist: {}", cwd.display());
         }
         let args = start_runner_args(opts);
-        let log_path = runner_log_path(opts.runner_id.as_deref(), cwd);
+        let log_path = runner_log_path(opts.runner_id.as_deref(), Some(cwd));
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let log_file = fs::File::create(&log_path)
-            .with_context(|| format!("failed to create {}", log_path.display()))?;
+        let mut log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        let _ = writeln!(
+            log_file,
+            "\n--- lazyamp start {} pid pending ---",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
         let err_file = log_file
             .try_clone()
             .context("failed to clone runner log file")?;
@@ -178,8 +225,19 @@ impl AmpClient {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
-        record_spawn(pid, opts.runner_id.as_deref(), cwd);
-        Ok(pid)
+        persist_launch_spec(&LaunchSpec {
+            runner_id: opts.runner_id.clone(),
+            cwd: cwd.to_path_buf(),
+            options: opts.clone(),
+        });
+        record_spawn(pid, opts, cwd);
+        let health = probe_start_health(self, pid, opts.runner_id.as_deref(), &log_path);
+        Ok(StartOutcome {
+            pid,
+            cwd: cwd.to_path_buf(),
+            log_path,
+            health,
+        })
     }
 
     fn run_ok(&self, args: &[&str]) -> Result<String> {
@@ -208,13 +266,74 @@ fn finish_output(args: &[&str], output: &std::process::Output) -> Result<String>
         return Ok(stdout);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout_t = stdout.trim();
+    let stderr_t = stderr.trim();
+    let detail = match (stdout_t.is_empty(), stderr_t.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout_t.to_string(),
+        (true, false) => stderr_t.to_string(),
+        (false, false) => format!("{stdout_t} {stderr_t}"),
+    };
     bail!(
-        "`amp {}` failed ({}): {} {}",
+        "`amp {}` failed ({}): {detail}",
         args.join(" "),
-        output.status,
-        stdout.trim(),
-        stderr.trim()
+        output.status
     );
+}
+
+fn probe_start_health(
+    client: &AmpClient,
+    pid: u32,
+    runner_id: Option<&str>,
+    log_path: &Path,
+) -> StartHealth {
+    for step in 0..8 {
+        std::thread::sleep(Duration::from_millis(150));
+        if !pid_present(pid) {
+            let hint = tail_log_lines(log_path, 12).join("\n");
+            return StartHealth::Exited { hint };
+        }
+        let log = fs::read_to_string(log_path).unwrap_or_default();
+        if looks_like_login_prompt(&log) {
+            return StartHealth::NeedsLogin;
+        }
+        if step >= 2 {
+            if let Ok(listed) = client.list_from_amp() {
+                if listed.iter().any(|r| {
+                    r.pid == Some(pid) || runner_id.is_some_and(|id| r.id.eq_ignore_ascii_case(id))
+                }) {
+                    return StartHealth::Listed;
+                }
+            }
+        }
+    }
+    StartHealth::Alive
+}
+
+/// Amp signed-out / login-prompt text seen with stdin attached to `/dev/null`.
+pub fn looks_like_login_prompt(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no api key")
+        || lower.contains("would you like to log in")
+        || lower.contains("log in to amp")
+        || lower.contains("starting login flow")
+}
+
+/// Last `n` lines of a runner log (empty if the file is missing).
+pub fn tail_log_lines(path: &Path, n: usize) -> Vec<String> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = raw.lines().collect();
+    lines
+        .iter()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Build argv for `amp --no-tui` (without the binary name).
@@ -503,17 +622,44 @@ fn infer_id_from_line(line: &str) -> String {
         if token.contains('=') {
             continue;
         }
-        return token.trim_matches(|c| c == ':' || c == ',').to_string();
+        let id = token.trim_matches(|c| c == ':' || c == ',').to_string();
+        if matches!(
+            id.to_ascii_lowercase().as_str(),
+            "no" | "error" | "warning" | "failed" | "found" | "runners"
+        ) {
+            continue;
+        }
+        return id;
     }
     String::new()
 }
 
 fn is_noise_line(line: &str) -> bool {
     let t = line.trim();
-    t.chars().all(|c| c == '-' || c == '=' || c == ' ')
-        || t.eq_ignore_ascii_case("runners")
-        || t.to_ascii_lowercase().ends_with(" runner(s)")
-        || t.to_ascii_lowercase().ends_with(" runners")
+    if t.is_empty() {
+        return true;
+    }
+    if t.chars().all(|c| c == '-' || c == '=' || c == ' ') {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.eq_ignore_ascii_case("runners") {
+        return true;
+    }
+    if lower.ends_with(" runner(s)") || lower.ends_with(" runners") {
+        return true;
+    }
+    if lower.contains("no runner")
+        || lower.contains("no running")
+        || lower.contains("not found")
+        || lower.contains("control socket")
+        || lower.starts_with("error")
+        || lower.starts_with("warning")
+        || lower.starts_with("failed")
+    {
+        return true;
+    }
+    false
 }
 
 fn looks_like_header(line: &str) -> bool {
@@ -589,12 +735,16 @@ fn extract_pid(line: &str) -> Option<u32> {
 }
 
 fn parse_pid_token(token: &str) -> Option<u32> {
-    token
+    let token = token
         .trim()
-        .trim_matches(|c: char| !c.is_ascii_digit())
+        .trim_matches(|c: char| matches!(c, ',' | ':' | ';' | '"' | '\'' | '(' | ')'));
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    token
         .parse()
         .ok()
-        .filter(|pid| *pid > 0)
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32)
 }
 
 fn push_unique_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
@@ -819,42 +969,90 @@ pub fn merge_runners(
 }
 
 fn find_match<'a>(runners: &'a mut [Runner], local: &LocalProcess) -> Option<&'a mut Runner> {
-    let by_id = local
-        .runner_id
-        .as_deref()
-        .and_then(|id| runners.iter().position(|r| r.id.eq_ignore_ascii_case(id)));
-    if let Some(idx) = by_id {
-        return Some(&mut runners[idx]);
-    }
-    let by_cwd = local.cwd.as_ref().and_then(|cwd| {
-        runners
+    if let Some(id) = local.runner_id.as_deref() {
+        if let Some(idx) = runners
             .iter()
-            .position(|r| r.cwd.as_ref() == Some(cwd) || r.dirs.iter().any(|d| d == cwd))
-    });
-    by_cwd.map(|idx| &mut runners[idx])
+            .position(|r| !r.id.is_empty() && r.id.eq_ignore_ascii_case(id))
+        {
+            return Some(&mut runners[idx]);
+        }
+    }
+    if local.pid > 0 {
+        if let Some(idx) = runners.iter().position(|r| r.pid == Some(local.pid)) {
+            return Some(&mut runners[idx]);
+        }
+    }
+    None
 }
 
-/// Stop a process. Sends SIGTERM, then SIGKILL if it is still alive.
-pub fn stop_pid(pid: u32) -> Result<()> {
-    if pid == 0 {
-        bail!("refusing to stop pid 0");
+/// Convert a PID to a `kill(2)` target.
+///
+/// Never returns a negative value. Negative targets are process-group or
+/// broadcast signals (`kill(-pid)` / `kill(-1)`).
+pub fn signal_target_pid(pid: u32) -> Result<i32> {
+    if pid <= 1 {
+        bail!("refusing to signal pid {pid} (init/kernel or invalid)");
     }
+    let target = i32::try_from(pid).map_err(|_| {
+        anyhow!("pid {pid} is out of range for kill(2); refusing wrap to a negative target")
+    })?;
+    if target <= 1 {
+        bail!("refusing to signal pid {target}");
+    }
+    Ok(target)
+}
+
+/// Stop a process after verifying it still looks like `amp --no-tui`.
+pub fn stop_pid(pid: u32) -> Result<StopOutcome> {
+    stop_verified(pid, None)
+}
+
+/// Stop `pid` only if it is `amp --no-tui` and (when known) the expected runner.
+pub fn stop_verified(pid: u32, expected_runner_id: Option<&str>) -> Result<StopOutcome> {
+    let target = signal_target_pid(pid)?;
+    if !pid_present(pid) {
+        forget_spawn(pid);
+        return Ok(StopOutcome::AlreadyGone);
+    }
+    verify_amp_identity(pid, expected_runner_id)?;
+
     #[cfg(unix)]
     {
-        send_signal(pid, libc::SIGTERM);
-        for _ in 0..25 {
-            if !pid_alive(pid) {
+        match send_signal(target, libc::SIGTERM) {
+            Ok(()) => {}
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
                 forget_spawn(pid);
-                return Ok(());
+                return Ok(StopOutcome::AlreadyGone);
+            }
+            Err(err) => bail!("SIGTERM to pid {pid} failed: {err}"),
+        }
+        for _ in 0..25 {
+            if !pid_present(pid) {
+                forget_spawn(pid);
+                return Ok(StopOutcome::Stopped);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        send_signal(pid, libc::SIGKILL);
-        forget_spawn(pid);
-        Ok(())
+        match send_signal(target, libc::SIGKILL) {
+            Ok(()) => {}
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
+                forget_spawn(pid);
+                return Ok(StopOutcome::Stopped);
+            }
+            Err(err) => bail!("SIGKILL to pid {pid} failed: {err}"),
+        }
+        for _ in 0..20 {
+            if !pid_present(pid) {
+                forget_spawn(pid);
+                return Ok(StopOutcome::Stopped);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        bail!("pid {pid} still present after SIGKILL");
     }
     #[cfg(not(unix))]
     {
+        let _ = target;
         let status = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status()
@@ -863,34 +1061,148 @@ pub fn stop_pid(pid: u32) -> Result<()> {
             bail!("taskkill exited with {status}");
         }
         forget_spawn(pid);
-        Ok(())
+        Ok(StopOutcome::Stopped)
     }
 }
 
+/// Send `sig` to exactly `target`. `target` must be a positive PID.
 #[cfg(unix)]
-fn send_signal(pid: u32, sig: i32) {
-    unsafe {
-        libc::kill(pid as i32, sig);
-        libc::kill(-(pid as i32), sig);
+fn send_signal(target: i32, sig: i32) -> io::Result<()> {
+    if target <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to signal a non-positive pid (would be a process group or broadcast)",
+        ));
+    }
+    let rc = unsafe { libc::kill(target, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
-pub fn pid_alive(pid: u32) -> bool {
+/// True if the process exists. `EPERM` means it exists but we cannot signal it.
+pub fn pid_present(pid: u32) -> bool {
+    let Ok(target) = signal_target_pid(pid) else {
+        return false;
+    };
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        let rc = unsafe { libc::kill(target, 0) };
+        if rc == 0 {
+            true
+        } else {
+            io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
     }
     #[cfg(not(unix))]
     {
+        let _ = target;
         Path::new(&format!("/proc/{pid}")).exists()
     }
 }
 
-fn runner_log_path(runner_id: Option<&str>, cwd: &Path) -> PathBuf {
+/// Confirm `pid` is `amp --no-tui` before signaling.
+///
+/// Linux prefers `/proc/<pid>/exe` plus cmdline. Other Unix platforms only have
+/// `ps` command lines — argv can be rewritten or truncated, so identity is
+/// weaker there.
+pub fn verify_amp_identity(pid: u32, expected_runner_id: Option<&str>) -> Result<LocalProcess> {
+    let _ = signal_target_pid(pid)?;
+    let proc = inspect_amp_process(pid)?;
+    if let Some(expected) = expected_runner_id.filter(|s| !s.is_empty()) {
+        if let Some(actual) = proc.runner_id.as_deref() {
+            if !actual.eq_ignore_ascii_case(expected) {
+                bail!("pid {pid} is runner `{actual}`, not `{expected}`");
+            }
+        }
+    }
+    Ok(proc)
+}
+
+fn inspect_amp_process(pid: u32) -> Result<LocalProcess> {
+    #[cfg(target_os = "linux")]
+    {
+        inspect_linux(pid)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        inspect_via_ps(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        bail!("cannot verify process identity on this platform (pid {pid})");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_linux(pid: u32) -> Result<LocalProcess> {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    if !proc_dir.exists() {
+        bail!("pid {pid} is gone");
+    }
+    let exe = fs::read_link(proc_dir.join("exe")).ok();
+    let bytes = fs::read(proc_dir.join("cmdline"))
+        .with_context(|| format!("failed to read /proc/{pid}/cmdline"))?;
+    let args = split_cmdline(&bytes);
+    let exe_is_amp = exe
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| {
+            let n = n.to_string_lossy();
+            n == "amp" || n == "amp.exe"
+        })
+        .unwrap_or(false);
+    let Some(mut proc) = parse_amp_cmdline(&args) else {
+        if exe_is_amp && args.iter().any(|a| a == "--no-tui") {
+            let mut proc = LocalProcess {
+                pid,
+                runner_id: flag_value(&args, "--runner-id"),
+                cwd: fs::read_link(proc_dir.join("cwd")).ok(),
+                extra_dirs: flag_values(&args, "--dir"),
+            };
+            proc.pid = pid;
+            return Ok(proc);
+        }
+        bail!(
+            "pid {pid} is not amp --no-tui (exe={}, cmdline={:?})",
+            exe.map(|p| p.display().to_string())
+                .unwrap_or_else(|| "?".into()),
+            args
+        );
+    };
+    proc.pid = pid;
+    proc.cwd = fs::read_link(proc_dir.join("cwd")).ok();
+    Ok(proc)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn inspect_via_ps(pid: u32) -> Result<LocalProcess> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-www", "-o", "command="])
+        .output()
+        .context("ps failed while verifying process identity")?;
+    if !output.status.success() {
+        bail!("pid {pid} is gone (ps exited {})", output.status);
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let args = shellish_split(line.trim());
+    let Some(mut proc) = parse_amp_cmdline(&args) else {
+        bail!("pid {pid} is not amp --no-tui (ps cmdline={:?})", args);
+    };
+    proc.pid = pid;
+    Ok(proc)
+}
+
+/// Log file for a runner under the state directory.
+pub fn runner_log_path(runner_id: Option<&str>, cwd: Option<&Path>) -> PathBuf {
     let slug = runner_id
         .map(sanitize_slug)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| sanitize_slug(&cwd.to_string_lossy()));
+        .or_else(|| cwd.map(|c| sanitize_slug(&c.to_string_lossy())))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "runner".into());
     state_dir().join("logs").join(format!("{slug}.log"))
 }
 
@@ -908,44 +1220,38 @@ fn sanitize_slug(s: &str) -> String {
     slug.trim_matches('_').to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct SpawnRecord {
     pid: u32,
     runner_id: Option<String>,
     cwd: String,
+    #[serde(default)]
+    options: Option<StartOptions>,
 }
 
 fn spawn_registry_path() -> PathBuf {
     state_dir().join("spawned.json")
 }
 
+fn launches_path() -> PathBuf {
+    state_dir().join("launches.json")
+}
+
 fn load_spawn_registry() -> Vec<LocalProcess> {
-    let path = spawn_registry_path();
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(records) = serde_json::from_str::<Vec<SpawnRecord>>(&raw) else {
-        return Vec::new();
-    };
-    records
+    load_spawn_raw()
         .into_iter()
-        .filter(|r| pid_alive(r.pid))
-        .map(|r| LocalProcess {
-            pid: r.pid,
-            runner_id: r.runner_id,
-            cwd: Some(PathBuf::from(r.cwd)),
-            extra_dirs: Vec::new(),
-        })
+        .filter_map(|r| verify_amp_identity(r.pid, r.runner_id.as_deref()).ok())
         .collect()
 }
 
-fn record_spawn(pid: u32, runner_id: Option<&str>, cwd: &Path) {
+fn record_spawn(pid: u32, opts: &StartOptions, cwd: &Path) {
     let mut records = load_spawn_raw();
-    records.retain(|r| r.pid != pid && pid_alive(r.pid));
+    records.retain(|r| r.pid != pid && verify_amp_identity(r.pid, r.runner_id.as_deref()).is_ok());
     records.push(SpawnRecord {
         pid,
-        runner_id: runner_id.map(ToOwned::to_owned),
+        runner_id: opts.runner_id.clone(),
         cwd: cwd.display().to_string(),
+        options: Some(opts.clone()),
     });
     save_spawn_raw(&records);
 }
@@ -957,21 +1263,146 @@ fn forget_spawn(pid: u32) {
 }
 
 fn load_spawn_raw() -> Vec<SpawnRecord> {
-    let path = spawn_registry_path();
-    fs::read_to_string(path)
+    fs::read_to_string(spawn_registry_path())
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
 fn save_spawn_raw(records: &[SpawnRecord]) {
-    let path = spawn_registry_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
     if let Ok(raw) = serde_json::to_string_pretty(records) {
-        let _ = fs::write(path, raw);
+        let _ = atomic_write(&spawn_registry_path(), raw);
     }
+}
+
+fn load_launches() -> Vec<LaunchSpec> {
+    fs::read_to_string(launches_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_launches(specs: &[LaunchSpec]) {
+    if let Ok(raw) = serde_json::to_string_pretty(specs) {
+        let _ = atomic_write(&launches_path(), raw);
+    }
+}
+
+fn same_launch_key(a: &LaunchSpec, b: &LaunchSpec) -> bool {
+    match (&a.runner_id, &b.runner_id) {
+        (Some(x), Some(y)) if x.eq_ignore_ascii_case(y) => true,
+        (None, None) => a.cwd == b.cwd,
+        _ => false,
+    }
+}
+
+/// Remember the argv/cwd used to start a runner (survives stop for restart).
+pub fn persist_launch_spec(spec: &LaunchSpec) {
+    let mut specs = load_launches();
+    specs.retain(|s| !same_launch_key(s, spec));
+    specs.push(spec.clone());
+    save_launches(&specs);
+}
+
+/// Look up a saved launch spec by runner-id, then uniquely by cwd (no id).
+pub fn find_launch_spec(runner_id: Option<&str>, cwd: Option<&Path>) -> Option<LaunchSpec> {
+    let specs = load_launches();
+    if let Some(id) = runner_id.filter(|s| !s.is_empty()) {
+        if let Some(spec) = specs.iter().find(|s| {
+            s.runner_id
+                .as_deref()
+                .is_some_and(|x| x.eq_ignore_ascii_case(id))
+        }) {
+            return Some(spec.clone());
+        }
+    }
+    if let Some(cwd) = cwd {
+        let matches: Vec<_> = specs
+            .iter()
+            .filter(|s| s.cwd == cwd && s.runner_id.is_none())
+            .cloned()
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches.into_iter().next().unwrap());
+        }
+    }
+    None
+}
+
+/// Validate a launch spec before stopping the old process for restart.
+pub fn validate_launch_spec(spec: &LaunchSpec) -> Result<()> {
+    if !spec.cwd.is_dir() {
+        bail!("launch cwd does not exist: {}", spec.cwd.display());
+    }
+    if let Some(id) = spec
+        .options
+        .runner_id
+        .as_deref()
+        .or(spec.runner_id.as_deref())
+    {
+        if !is_plausible_runner_id(id) {
+            bail!("launch runner-id `{id}` is not a hostname");
+        }
+    }
+    Ok(())
+}
+
+/// Start options taken from a saved spec (never from global defaults).
+pub fn restart_start_options(spec: &LaunchSpec) -> StartOptions {
+    let mut opts = spec.options.clone();
+    if opts.runner_id.is_none() {
+        opts.runner_id = spec.runner_id.clone();
+    }
+    opts
+}
+
+/// Resolve the spec used to restart `runner`. Prefers the saved launch spec,
+/// then the live process argv. Does not use global config defaults.
+pub fn launch_spec_for_restart(runner: &Runner) -> Result<LaunchSpec> {
+    if let Some(spec) = find_launch_spec(runner.runner_id_flag(), runner.cwd.as_deref()) {
+        validate_launch_spec(&spec)?;
+        return Ok(spec);
+    }
+    if let Some(pid) = runner.pid {
+        if let Ok(proc) = verify_amp_identity(pid, runner.runner_id_flag()) {
+            let cwd = proc
+                .cwd
+                .clone()
+                .or_else(|| runner.cwd.clone())
+                .or_else(|| runner.dirs.first().cloned())
+                .ok_or_else(|| anyhow!("cannot restart: no working directory for this runner"))?;
+            let opts = StartOptions {
+                runner_id: proc
+                    .runner_id
+                    .clone()
+                    .or_else(|| runner.runner_id_flag().map(str::to_string)),
+                extra_dirs: proc.extra_dirs,
+                ..StartOptions::default()
+            };
+            let spec = LaunchSpec {
+                runner_id: opts.runner_id.clone(),
+                cwd,
+                options: opts,
+            };
+            validate_launch_spec(&spec)?;
+            return Ok(spec);
+        }
+    }
+    let cwd = runner
+        .cwd
+        .clone()
+        .or_else(|| runner.dirs.first().cloned())
+        .ok_or_else(|| anyhow!("cannot restart: no saved launch spec and no working directory"))?;
+    let spec = LaunchSpec {
+        runner_id: runner.runner_id_flag().map(str::to_string),
+        cwd,
+        options: StartOptions {
+            runner_id: runner.runner_id_flag().map(str::to_string),
+            ..StartOptions::default()
+        },
+    };
+    validate_launch_spec(&spec)?;
+    Ok(spec)
 }
 
 pub fn missing_amp_message(binary: &Path) -> String {
@@ -1259,6 +1690,114 @@ mac-mini (pid 4321)
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "solo");
         assert!(!merged[0].from_amp_list);
+    }
+
+    #[test]
+    fn parser_ignores_empty_and_error_text() {
+        assert!(parse_runner_list("No runners found.").unwrap().is_empty());
+        assert!(parse_runner_list(
+            "No running amp --no-tui runner with a control socket on this machine."
+        )
+        .unwrap()
+        .is_empty());
+        assert!(parse_runner_list("error: not found\n").unwrap().is_empty());
+        assert!(parse_runner_list("failed to list runners\n")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_pid_rejects_zero_and_i32_overflow() {
+        assert_eq!(parse_pid_token("0"), None);
+        assert_eq!(parse_pid_token("-1"), None);
+        assert_eq!(parse_pid_token("4294967295"), None);
+        assert_eq!(parse_pid_token(&(u32::MAX.to_string())), None);
+        assert_eq!(parse_pid_token("1234"), Some(1234));
+        assert_eq!(
+            parse_pid_token(&(i32::MAX as u32).to_string()),
+            Some(i32::MAX as u32)
+        );
+        assert_eq!(parse_pid_token(&((i32::MAX as u32) + 1).to_string()), None);
+    }
+
+    #[test]
+    fn signal_target_never_negative_or_init() {
+        assert!(signal_target_pid(0).is_err());
+        assert!(signal_target_pid(1).is_err());
+        assert!(signal_target_pid(u32::MAX).is_err());
+        let ok = signal_target_pid(4321).unwrap();
+        assert!(ok > 1);
+        assert_eq!(ok, 4321);
+        for pid in [2u32, 100, 65535, i32::MAX as u32] {
+            let t = signal_target_pid(pid).expect("valid pid");
+            assert!(
+                t > 0,
+                "signal target must be the exact process, never a group"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_does_not_attach_pid_by_cwd_only() {
+        let listed = vec![Runner {
+            id: "alpha".into(),
+            pid: None,
+            cwd: Some(PathBuf::from("/work")),
+            dirs: vec![PathBuf::from("/work")],
+            from_amp_list: true,
+            from_local_scan: false,
+        }];
+        let local = vec![LocalProcess {
+            pid: 99,
+            runner_id: Some("beta".into()),
+            cwd: Some(PathBuf::from("/work")),
+            extra_dirs: Vec::new(),
+        }];
+        let merged = merge_runners(listed, &local, &[]);
+        assert_eq!(merged.len(), 2);
+        let alpha = merged.iter().find(|r| r.id == "alpha").unwrap();
+        assert_eq!(alpha.pid, None);
+        let beta = merged.iter().find(|r| r.id == "beta").unwrap();
+        assert_eq!(beta.pid, Some(99));
+    }
+
+    #[test]
+    fn restart_args_come_from_launch_spec_not_defaults() {
+        let spec = LaunchSpec {
+            runner_id: Some("alpha".into()),
+            cwd: PathBuf::from("/tmp/alpha"),
+            options: StartOptions {
+                runner_id: Some("alpha".into()),
+                mode: Some("high".into()),
+                extra_dirs: vec![PathBuf::from("/extra")],
+                discover_dirs: true,
+                ..StartOptions::default()
+            },
+        };
+        let opts = restart_start_options(&spec);
+        assert_eq!(
+            start_runner_args(&opts),
+            vec![
+                "--no-tui",
+                "--runner-id",
+                "alpha",
+                "--mode",
+                "high",
+                "--discover-dirs",
+                "--dir",
+                "/extra",
+            ]
+        );
+        assert_ne!(opts.mode.as_deref(), Some("low"));
+        assert_ne!(opts.runner_id.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn login_prompt_detection() {
+        assert!(looks_like_login_prompt(
+            "No API key found. Starting login flow...\nWould you like to log in to Amp? [(y)es, (n)o]:"
+        ));
+        assert!(!looks_like_login_prompt("runner started on port 12"));
     }
 
     #[test]

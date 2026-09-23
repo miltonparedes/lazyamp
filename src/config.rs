@@ -1,10 +1,34 @@
 //! Persistent lazyamp preferences (`$XDG_CONFIG_HOME/lazyamp/config.toml`).
 
 use crate::amp::StartOptions;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// How a config file was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// No file on disk. Defaults are fine and may be written on quit.
+    Missing,
+    /// Parsed an existing file. Safe to write back.
+    File,
+}
+
+/// Result of loading config without hiding parse failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub source: ConfigSource,
+}
+
+impl LoadedConfig {
+    /// Missing and valid files may be written. Invalid files never reach here.
+    pub fn may_write(&self) -> bool {
+        matches!(self.source, ConfigSource::Missing | ConfigSource::File)
+    }
+}
 
 /// Maximum remembered working directories.
 pub const MAX_RECENT_DIRS: usize = 12;
@@ -96,19 +120,30 @@ pub fn state_dir_from(state_home: Option<PathBuf>) -> PathBuf {
 }
 
 impl Config {
-    /// Load config from the default path. Missing file yields defaults.
-    pub fn load() -> Result<Self> {
+    /// Load config from the default path.
+    ///
+    /// A missing file is [`ConfigSource::Missing`] (defaults). An existing file
+    /// that fails to parse is an error — callers must not overwrite it.
+    pub fn load() -> Result<LoadedConfig> {
         Self::load_from(&config_path())
     }
 
-    /// Load config from `path`. Missing file yields defaults.
-    pub fn load_from(path: &Path) -> Result<Self> {
+    /// Load config from `path`. Missing file yields defaults tagged as missing.
+    pub fn load_from(path: &Path) -> Result<LoadedConfig> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(LoadedConfig {
+                config: Self::default(),
+                source: ConfigSource::Missing,
+            });
         }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        Self::parse(&raw).with_context(|| format!("failed to parse {}", path.display()))
+        let config =
+            Self::parse(&raw).with_context(|| format!("invalid config file {}", path.display()))?;
+        Ok(LoadedConfig {
+            config,
+            source: ConfigSource::File,
+        })
     }
 
     /// Parse TOML into a [`Config`].
@@ -144,14 +179,9 @@ impl Config {
         toml::to_string_pretty(self).context("failed to serialize config")
     }
 
-    /// Write config to `path`, creating parent directories.
+    /// Write config to `path`, creating parent directories (temp + rename).
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(path, self.to_toml()?)
-            .with_context(|| format!("failed to write {}", path.display()))
+        atomic_write(path, self.to_toml()?)
     }
 
     /// Write config to the default path.
@@ -195,6 +225,36 @@ pub fn cycle_choice(current: Option<&str>, choices: &[&str]) -> Option<String> {
         Some(i) if i + 1 < choices.len() => Some(choices[i + 1].to_string()),
         _ => None,
     }
+}
+
+/// Write `contents` to `path` via a same-directory temp file and rename.
+pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let dir = parent.unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let write_tmp = || -> Result<()> {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(contents.as_ref())
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp.display()))?;
+        Ok(())
+    };
+    if let Err(err) = write_tmp() {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        bail!("failed to replace {}: {err}", path.display());
+    }
+    Ok(())
 }
 
 pub const MODES: &[&str] = &["low", "medium", "high", "ultra"];
@@ -286,7 +346,25 @@ mode = ""
     fn load_missing_file_is_default() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("missing.toml");
-        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.source, ConfigSource::Missing);
+        assert_eq!(loaded.config, Config::default());
+        assert!(loaded.may_write());
+    }
+
+    #[test]
+    fn load_invalid_file_is_error_and_does_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "this is not = [ toml\nrunner_id = \"oops";
+        fs::write(&path, original).unwrap();
+        let err = Config::load_from(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid") || msg.contains("TOML") || msg.contains("toml"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
@@ -298,7 +376,24 @@ mode = ""
         cfg.remember_dir(Path::new("/work"));
         cfg.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
-        assert_eq!(loaded, cfg);
+        assert_eq!(loaded.source, ConfigSource::File);
+        assert_eq!(loaded.config, cfg);
+        assert!(loaded.may_write());
+    }
+
+    #[test]
+    fn atomic_write_replaces_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("file.txt");
+        atomic_write(&path, "one").unwrap();
+        atomic_write(&path, "two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path() != path)
+            .collect();
+        assert!(leftovers.is_empty(), "temp file leaked: {leftovers:?}");
     }
 
     #[test]
