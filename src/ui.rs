@@ -8,6 +8,10 @@ use crate::amp::{
 use crate::config::{
     config_path, cycle_choice, Config, StartDefaults, LOG_LEVELS, MODES, VISIBILITIES,
 };
+use crate::dirpick::{
+    collect_ranked_paths, query_zoxide_dirs, walk_matching_dirs, PathSource, RankedPath,
+    RankedSearch,
+};
 use anyhow::Result;
 use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -22,7 +26,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::collections::VecDeque;
-use std::fs;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -30,31 +33,36 @@ use std::time::{Duration, Instant};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(3);
 const LOG_CAP: usize = 200;
+const PICKER_DEBOUNCE: Duration = Duration::from_millis(120);
 const HELP_TEXT: &str = "\
 lazyamp — manage Amp --no-tui runners
 
 Navigation
   hjkl / arrows     move; h/l also switch panes
-  Tab               next pane (runners ↔ dirs)
+  Tab               next pane (runners ↔ served dirs)
   Enter             confirm (picker / flags / typed path)
   Esc               close overlay
   q / Ctrl-c        quit
   ?                 this help
 
 Runners
-  s                 start amp --no-tui in a chosen directory
+  s                 start amp --no-tui (pick the process start cwd)
   x                 stop the selected runner (confirms)
   r                 restart selected runner (confirms)
   g                 refresh `amp runner list`
 
-Directories
+Served directories (paths the runner can see; not the start cwd)
   a                 add a served directory (`amp runner dirs add`)
-  d                 remove the selected directory (confirms)
+  d                 remove the selected served directory
 
 Other
   f                 common flags / defaults (saved to config)
   u                 run `amp update`
   c                 show config path
+
+Directory picker: hjkl browse immediate children. / or typing filters
+recursively under the browse root, plus recent dirs and `zoxide query -l`
+when zoxide is installed.
 
 This UI does not open Amp's interactive agent TUI.";
 
@@ -153,6 +161,19 @@ enum AmpEvent {
     Failed(String),
 }
 
+enum PickerJob {
+    Search {
+        gen: u64,
+        query: String,
+        browse_root: PathBuf,
+        recent_dirs: Vec<String>,
+    },
+}
+
+enum PickerEvent {
+    Results { gen: u64, entries: Vec<PickerEntry> },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerPurpose {
     Start,
@@ -238,6 +259,9 @@ struct DirPicker {
     browse_root: PathBuf,
     cursor: usize,
     entries: Vec<PickerEntry>,
+    search_gen: u64,
+    searching: bool,
+    debounce_until: Option<Instant>,
 }
 
 struct App {
@@ -264,6 +288,8 @@ struct App {
     help_scroll: u16,
     job_tx: Sender<AmpJob>,
     ev_rx: Receiver<AmpEvent>,
+    picker_tx: Sender<PickerJob>,
+    picker_rx: Receiver<PickerEvent>,
 }
 
 struct LogLine {
@@ -321,6 +347,41 @@ pub fn run() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+fn spawn_picker_worker() -> (Sender<PickerJob>, Receiver<PickerEvent>) {
+    let (job_tx, job_rx) = mpsc::channel();
+    let (ev_tx, ev_rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("lazyamp-dirs".into())
+        .spawn(move || picker_worker_loop(job_rx, ev_tx))
+        .expect("failed to start directory search thread");
+    (job_tx, ev_rx)
+}
+
+fn picker_worker_loop(jobs: Receiver<PickerJob>, events: Sender<PickerEvent>) {
+    while let Ok(job) = jobs.recv() {
+        let PickerJob::Search {
+            gen,
+            query,
+            browse_root,
+            recent_dirs,
+        } = job;
+        let entries = filter_search_entries(&query, &browse_root, &recent_dirs);
+        if events.send(PickerEvent::Results { gen, entries }).is_err() {
+            break;
+        }
+    }
+}
+
+fn filter_search_entries(
+    query: &str,
+    browse_root: &Path,
+    recent_dirs: &[String],
+) -> Vec<PickerEntry> {
+    let zoxide = query_zoxide_dirs();
+    let nested = walk_matching_dirs(browse_root, query);
+    picker_entries_from_sources(query, browse_root, recent_dirs, &zoxide, &nested, false)
 }
 
 fn spawn_amp_worker(client: AmpClient) -> (Sender<AmpJob>, Receiver<AmpEvent>) {
@@ -439,11 +500,13 @@ fn run_job(client: &AmpClient, job: AmpJob) -> AmpEvent {
 fn app_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         app.drain_events();
+        app.drain_picker_events();
+        app.maybe_dispatch_picker_search();
         terminal.draw(|f| draw(f, app))?;
         if app.should_quit {
             break;
         }
-        if event::poll(Duration::from_millis(200))? {
+        if event::poll(app.poll_timeout())? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     app.handle_key(key);
@@ -467,6 +530,7 @@ impl App {
         let amp_version = client.version().unwrap_or_else(|_| "unknown".into());
         let binary = client.binary.display().to_string();
         let (job_tx, ev_rx) = spawn_amp_worker(client);
+        let (picker_tx, picker_rx) = spawn_picker_worker();
         let mut app = Self {
             config,
             config_path,
@@ -491,6 +555,8 @@ impl App {
             help_scroll: 0,
             job_tx,
             ev_rx,
+            picker_tx,
+            picker_rx,
         };
         app.log(
             LogKind::Info,
@@ -551,6 +617,75 @@ impl App {
                     break;
                 }
             }
+        }
+    }
+
+    fn poll_timeout(&self) -> Duration {
+        if let Some(picker) = &self.picker {
+            if let Some(until) = picker.debounce_until {
+                let remaining = until.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Duration::from_millis(10);
+                }
+                return remaining.min(Duration::from_millis(200));
+            }
+        }
+        Duration::from_millis(200)
+    }
+
+    fn drain_picker_events(&mut self) {
+        loop {
+            match self.picker_rx.try_recv() {
+                Ok(PickerEvent::Results { gen, entries }) => {
+                    let Some(picker) = self.picker.as_mut() else {
+                        continue;
+                    };
+                    if picker.search_gen != gen {
+                        continue;
+                    }
+                    let prev = picker.entries.get(picker.cursor).map(|e| e.path.clone());
+                    picker.entries = entries;
+                    picker.searching = false;
+                    if let Some(prev) = prev {
+                        if let Some(idx) = picker.entries.iter().position(|e| e.path == prev) {
+                            picker.cursor = idx;
+                        } else {
+                            picker.cursor = 0;
+                        }
+                    } else if picker.cursor >= picker.entries.len() {
+                        picker.cursor = picker.entries.len().saturating_sub(1);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn maybe_dispatch_picker_search(&mut self) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let Some(until) = picker.debounce_until else {
+            return;
+        };
+        if Instant::now() < until {
+            return;
+        }
+        picker.debounce_until = None;
+        let query = picker.input.trim().to_string();
+        if query.is_empty() {
+            picker.searching = false;
+            return;
+        }
+        let job = PickerJob::Search {
+            gen: picker.search_gen,
+            query,
+            browse_root: picker.browse_root.clone(),
+            recent_dirs: expanded_recent_dirs(&self.config),
+        };
+        if self.picker_tx.send(job).is_err() {
+            picker.searching = false;
         }
     }
 
@@ -799,7 +934,7 @@ impl App {
                     picker.input.clear();
                     picker.filter_mode = false;
                     picker.cursor = 0;
-                    rebuild_picker(picker, &self.config);
+                    refresh_picker(picker, &self.config);
                 } else {
                     self.picker = None;
                     self.overlay = Overlay::None;
@@ -825,7 +960,7 @@ impl App {
                     if entry.path.is_dir() {
                         picker.browse_root = entry.path;
                         picker.cursor = 0;
-                        rebuild_picker(picker, &self.config);
+                        refresh_picker(picker, &self.config);
                     }
                 }
             }
@@ -833,7 +968,7 @@ impl App {
                 if let Some(parent) = picker.browse_root.parent() {
                     picker.browse_root = parent.to_path_buf();
                     picker.cursor = 0;
-                    rebuild_picker(picker, &self.config);
+                    refresh_picker(picker, &self.config);
                 }
             }
             KeyCode::Char('l') if key.modifiers.is_empty() && !picker.filter_mode => {
@@ -841,7 +976,7 @@ impl App {
                     if entry.path.is_dir() {
                         picker.browse_root = entry.path;
                         picker.cursor = 0;
-                        rebuild_picker(picker, &self.config);
+                        refresh_picker(picker, &self.config);
                     }
                 }
             }
@@ -849,7 +984,7 @@ impl App {
                 if let Some(parent) = picker.browse_root.parent() {
                     picker.browse_root = parent.to_path_buf();
                     picker.cursor = 0;
-                    rebuild_picker(picker, &self.config);
+                    refresh_picker(picker, &self.config);
                 }
             }
             KeyCode::Down => {
@@ -877,7 +1012,7 @@ impl App {
                     picker.filter_mode = false;
                 }
                 picker.cursor = 0;
-                rebuild_picker(picker, &self.config);
+                refresh_picker(picker, &self.config);
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -886,7 +1021,7 @@ impl App {
                 picker.filter_mode = true;
                 picker.input.push(c);
                 picker.cursor = 0;
-                rebuild_picker(picker, &self.config);
+                refresh_picker(picker, &self.config);
             }
             _ => {}
         }
@@ -1048,8 +1183,11 @@ impl App {
             browse_root,
             cursor: 0,
             entries: Vec::new(),
+            search_gen: 0,
+            searching: false,
+            debounce_until: None,
         };
-        rebuild_picker(&mut picker, &self.config);
+        refresh_picker(&mut picker, &self.config);
         self.picker = Some(picker);
         self.overlay = Overlay::Picker;
     }
@@ -1276,116 +1414,110 @@ fn picker_selected_path(picker: &DirPicker) -> Option<PathBuf> {
     picker.entries.get(picker.cursor).map(|e| e.path.clone())
 }
 
-fn rebuild_picker(picker: &mut DirPicker, config: &Config) {
+fn refresh_picker(picker: &mut DirPicker, config: &Config) {
+    picker.search_gen = picker.search_gen.wrapping_add(1);
     let query = picker.input.trim();
-    let mut entries = Vec::new();
-    let typed = expand_path(query);
-    if let Ok(cwd) = std::env::current_dir() {
-        entries.push(PickerEntry {
-            label: format!("current  {}", display_path(&cwd)),
-            path: cwd,
-        });
+    if query.is_empty() {
+        picker.searching = false;
+        picker.debounce_until = None;
+        picker.filter_mode = picker.filter_mode && !picker.input.is_empty();
+        picker.entries = picker_entries_from_sources(
+            "",
+            &picker.browse_root,
+            &expanded_recent_dirs(config),
+            &[],
+            &[],
+            true,
+        );
+    } else {
+        picker.searching = true;
+        picker.debounce_until = Some(Instant::now() + PICKER_DEBOUNCE);
+        picker.entries = picker_entries_from_sources(
+            query,
+            &picker.browse_root,
+            &expanded_recent_dirs(config),
+            &[],
+            &[],
+            false,
+        );
     }
-    if let Some(home) = dirs::home_dir() {
-        entries.push(PickerEntry {
-            label: format!("home     {}", display_path(&home)),
-            path: home,
-        });
-    }
-    for recent in &config.recent_dirs {
-        let path = expand_path(recent);
-        entries.push(PickerEntry {
-            label: format!("recent   {}", display_path(&path)),
-            path,
-        });
-    }
-    if let Some(parent) = picker.browse_root.parent() {
-        entries.push(PickerEntry {
-            label: format!("..       {}", display_path(parent)),
-            path: parent.to_path_buf(),
-        });
-    }
-    for child in list_subdirs(&picker.browse_root) {
-        let name = child
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| child.display().to_string());
-        entries.push(PickerEntry {
-            label: format!("browse   {name}/"),
-            path: child,
-        });
-    }
-    if !query.is_empty() {
-        entries.retain(|e| {
-            fuzzy_match(query, &e.label) || fuzzy_match(query, &e.path.to_string_lossy())
-        });
-        if typed.is_dir() && !entries.iter().any(|e| e.path == typed) {
-            entries.push(PickerEntry {
-                label: format!("exact    {}", display_path(&typed)),
-                path: typed,
-            });
-        }
-    }
-    let mut seen = Vec::new();
-    entries.retain(|e| {
-        if seen.iter().any(|p| p == &e.path) {
-            false
-        } else {
-            seen.push(e.path.clone());
-            true
-        }
-    });
-    picker.entries = entries;
     if picker.cursor >= picker.entries.len() {
         picker.cursor = picker.entries.len().saturating_sub(1);
     }
 }
 
-fn list_subdirs(root: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let Ok(rd) = fs::read_dir(root) else {
-        return dirs;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !meta.is_dir() {
-            continue;
-        }
-        if let Some(name) = path.file_name() {
-            let name = name.to_string_lossy();
-            if name.starts_with('.') {
-                continue;
-            }
-        }
-        dirs.push(path);
-    }
-    dirs.sort();
-    dirs
+fn expanded_recent_dirs(config: &Config) -> Vec<String> {
+    config
+        .recent_dirs
+        .iter()
+        .map(|d| expand_path(d).display().to_string())
+        .collect()
 }
 
-pub fn fuzzy_match(query: &str, candidate: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let q = query.to_ascii_lowercase();
-    let c = candidate.to_ascii_lowercase();
-    if c.contains(&q) {
-        return true;
-    }
-    let mut it = c.chars();
-    for qc in q.chars() {
-        loop {
-            match it.next() {
-                Some(cc) if cc == qc => break,
-                Some(_) => continue,
-                None => return false,
+fn picker_entries_from_sources(
+    query: &str,
+    browse_root: &Path,
+    recent_dirs: &[String],
+    zoxide_dirs: &[PathBuf],
+    nested_dirs: &[PathBuf],
+    browse_children: bool,
+) -> Vec<PickerEntry> {
+    let cwd = std::env::current_dir().ok();
+    let home = dirs::home_dir();
+    let typed = {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(expand_path(trimmed))
+        }
+    };
+    let ranked = collect_ranked_paths(RankedSearch {
+        query,
+        browse_root,
+        recent_dirs,
+        zoxide_dirs,
+        nested_dirs,
+        cwd: cwd.as_deref(),
+        home: home.as_deref(),
+        typed_exact: typed.as_deref(),
+        browse_children,
+    });
+    ranked
+        .into_iter()
+        .map(|ranked| ranked_to_entry(ranked, browse_root))
+        .collect()
+}
+
+fn ranked_to_entry(ranked: RankedPath, browse_root: &Path) -> PickerEntry {
+    let shown = display_path(&ranked.path);
+    let label = match ranked.source {
+        PathSource::Current => format!("current  {shown}"),
+        PathSource::Home => format!("home     {shown}"),
+        PathSource::Recent => format!("recent   {shown}"),
+        PathSource::Zoxide => format!("zoxide   {shown}"),
+        PathSource::Parent => format!("..       {shown}"),
+        PathSource::Browse => {
+            let name = ranked
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| shown.clone());
+            format!("browse   {name}/")
+        }
+        PathSource::Nested => {
+            if let Ok(rel) = ranked.path.strip_prefix(browse_root) {
+                format!("nested   {}/", rel.display())
+            } else {
+                format!("nested   {shown}")
             }
         }
+        PathSource::Exact => format!("exact    {shown}"),
+    };
+    PickerEntry {
+        label,
+        path: ranked.path,
     }
-    true
 }
 
 fn expand_path(s: &str) -> PathBuf {
@@ -1621,16 +1753,19 @@ fn draw_runners(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 fn draw_dirs(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let focused = app.pane == Pane::Dirs && app.overlay == Overlay::None;
     let title = match app.current_runner() {
-        Some(r) => format!(" dirs · {} ", r.display_id()),
-        None => " dirs ".into(),
+        Some(r) => format!(" served dirs · {} ", r.display_id()),
+        None => " served dirs ".into(),
     };
     let block = pane_block(&title, focused);
     let dirs = app.current_dirs();
     if dirs.is_empty() {
-        let empty =
-            Paragraph::new("No directories recorded.\nPress a to add (`amp runner dirs add`).")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(block);
+        let empty = Paragraph::new(
+            "No served directories recorded.\n\
+             a adds a served path (`amp runner dirs add`).\n\
+             s starts a runner in a working directory (start cwd).",
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .block(block);
         frame.render_widget(empty, area);
         return;
     }
@@ -1817,8 +1952,8 @@ fn draw_picker(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let popup = centered(area, 76, 80);
     frame.render_widget(Clear, popup);
     let title = match picker.purpose {
-        PickerPurpose::Start => " start runner · pick working directory ",
-        PickerPurpose::AddDir => " add directory to selected runner ",
+        PickerPurpose::Start => " start runner · pick start cwd ",
+        PickerPurpose::AddDir => " add served directory to selected runner ",
     };
     let outer = Block::default()
         .title(title)
@@ -1838,7 +1973,13 @@ fn draw_picker(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         ])
         .split(inner);
 
-    let mode = if picker.filter_mode { "filter" } else { "nav" };
+    let mode = if picker.searching {
+        "searching"
+    } else if picker.filter_mode {
+        "filter"
+    } else {
+        "nav"
+    };
     let input = Paragraph::new(format!("{}_", picker.input)).block(
         Block::default()
             .borders(Borders::ALL)
@@ -1868,9 +2009,11 @@ fn draw_picker(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         &mut state,
     );
 
-    let hint = Paragraph::new("/ filter · hjkl/arrows move (nav) · enter select highlighted")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::DarkGray));
+    let hint = Paragraph::new(
+        "/ recursive filter · zoxide if installed · hjkl browse children (nav) · enter select",
+    )
+    .alignment(Alignment::Center)
+    .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(hint, chunks[2]);
 }
 
@@ -1900,7 +2043,7 @@ fn draw_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 .selected_dir_path()
                 .map(|p| display_path(&p))
                 .unwrap_or_else(|| "?".into());
-            format!("Remove directory `{path}` from the selected runner?")
+            format!("Remove served directory `{path}` from the selected runner?")
         }
     };
     let block = Block::default()
@@ -1957,10 +2100,10 @@ mod tests {
 
     #[test]
     fn fuzzy_contains_and_subsequence() {
-        assert!(fuzzy_match("amp", "/home/me/amp-cli"));
-        assert!(fuzzy_match("hml", "/home/me/lazy"));
-        assert!(!fuzzy_match("zzz", "/home/me"));
-        assert!(fuzzy_match("", "anything"));
+        assert!(crate::dirpick::fuzzy_match("amp", "/home/me/amp-cli"));
+        assert!(crate::dirpick::fuzzy_match("hml", "/home/me/lazy"));
+        assert!(!crate::dirpick::fuzzy_match("zzz", "/home/me"));
+        assert!(crate::dirpick::fuzzy_match("", "anything"));
     }
 
     #[test]

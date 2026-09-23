@@ -4,6 +4,7 @@ use crate::config::{atomic_write, state_dir};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -100,6 +101,8 @@ pub struct LocalProcess {
     pub runner_id: Option<String>,
     pub cwd: Option<PathBuf>,
     pub extra_dirs: Vec<PathBuf>,
+    /// Parent PID when known (Linux `/proc` or `ps`). Used to collapse helpers.
+    pub ppid: Option<u32>,
 }
 
 /// Located Amp binary plus helpers to invoke it.
@@ -797,13 +800,12 @@ fn json_dirs(value: Value) -> Vec<PathBuf> {
 }
 
 /// Parse a process cmdline; returns info if it looks like `amp --no-tui`.
+///
+/// Matches a binary named `amp`, and also a JS runtime (`node`/`bun`/`deno`)
+/// whose first script path looks like the Amp CLI. `--no-tui` is required so
+/// ordinary `node` programs are not treated as runners.
 pub fn parse_amp_cmdline(args: &[String]) -> Option<LocalProcess> {
-    let bin = args.first()?;
-    let name = Path::new(bin).file_name()?.to_string_lossy();
-    if name != "amp" && name != "amp.exe" {
-        return None;
-    }
-    if !args.iter().any(|a| a == "--no-tui") {
+    if !looks_like_amp_no_tui(args) {
         return None;
     }
     Some(LocalProcess {
@@ -811,6 +813,61 @@ pub fn parse_amp_cmdline(args: &[String]) -> Option<LocalProcess> {
         runner_id: flag_value(args, "--runner-id"),
         cwd: None,
         extra_dirs: flag_values(args, "--dir"),
+        ppid: None,
+    })
+}
+
+fn looks_like_amp_no_tui(args: &[String]) -> bool {
+    if !args.iter().any(|a| a == "--no-tui") {
+        return false;
+    }
+    let Some(first) = args.first() else {
+        return false;
+    };
+    let first_name = file_name_lower(first);
+    if is_amp_bin_name(&first_name) {
+        return true;
+    }
+    if is_js_runtime_name(&first_name) {
+        if let Some(script) = first_positional_arg(&args[1..]) {
+            return looks_like_amp_script(script);
+        }
+    }
+    false
+}
+
+fn file_name_lower(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_amp_bin_name(name: &str) -> bool {
+    name == "amp" || name == "amp.exe"
+}
+
+fn is_js_runtime_name(name: &str) -> bool {
+    matches!(
+        name,
+        "node" | "nodejs" | "node.exe" | "bun" | "bun.exe" | "deno" | "deno.exe"
+    )
+}
+
+fn first_positional_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|arg| !arg.starts_with('-'))
+}
+
+fn looks_like_amp_script(path: &str) -> bool {
+    let name = file_name_lower(path);
+    if is_amp_bin_name(&name) || matches!(name.as_str(), "amp.js" | "amp.mjs" | "amp.cjs") {
+        return true;
+    }
+    Path::new(path).components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s.eq_ignore_ascii_case("amp")
     })
 }
 
@@ -881,6 +938,7 @@ fn scan_linux_proc() -> Vec<LocalProcess> {
         };
         proc.pid = pid;
         proc.cwd = fs::read_link(entry.path().join("cwd")).ok();
+        proc.ppid = linux_ppid(&entry.path());
         found.push(proc);
     }
     found
@@ -889,7 +947,7 @@ fn scan_linux_proc() -> Vec<LocalProcess> {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn scan_via_ps() -> Vec<LocalProcess> {
     let output = Command::new("ps")
-        .args(["-ax", "-o", "pid=,command="])
+        .args(["-ax", "-o", "pid=,ppid=,command="])
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -905,11 +963,26 @@ fn scan_via_ps() -> Vec<LocalProcess> {
 fn parse_ps_line(line: &str) -> Option<LocalProcess> {
     let line = line.trim();
     let (pid_str, rest) = line.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (ppid_str, cmd) = rest.split_once(char::is_whitespace)?;
     let pid = pid_str.parse().ok()?;
-    let args = shellish_split(rest);
+    let ppid = ppid_str.parse().ok();
+    let args = shellish_split(cmd.trim_start());
     let mut proc = parse_amp_cmdline(&args)?;
     proc.pid = pid;
+    proc.ppid = ppid;
     Some(proc)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ppid(proc_dir: &Path) -> Option<u32> {
+    let raw = fs::read_to_string(proc_dir.join("status")).ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().ok().filter(|pid| *pid > 0);
+        }
+    }
+    None
 }
 
 pub fn split_cmdline(bytes: &[u8]) -> Vec<String> {
@@ -925,64 +998,387 @@ fn shellish_split(line: &str) -> Vec<String> {
     line.split_whitespace().map(ToOwned::to_owned).collect()
 }
 
-/// Merge Amp's list with local PIDs. Amp list wins for IDs/dirs; local scan fills PIDs.
+/// Merge Amp's list with local PIDs.
+///
+/// One logical Amp runner becomes one row:
+/// - Amp `runner list` identity wins (id, dirs, listed PID when that PID is live).
+/// - Local `amp --no-tui` processes are grouped by runner-id and process tree
+///   so wrapper/runtime children are not extra rows.
+/// - An unnamed local tree attaches to a unique leftover listed runner (Amp
+///   often assigns `--runner-id` after start, so cmdline may not have it).
+/// - Distinct runner-ids that share a working directory stay separate.
+/// - The attached PID is the listed PID if it is in the group, otherwise the
+///   process-tree root (best target for stop/restart).
 pub fn merge_runners(
     listed: Vec<Runner>,
     local: &[LocalProcess],
     spawned: &[LocalProcess],
 ) -> Vec<Runner> {
-    let mut runners = listed;
+    let mut listed = collapse_listed_runners(listed);
+    let groups = group_local_processes(local, spawned);
+    let mut used = vec![false; listed.len()];
+    let mut extras = Vec::new();
+
+    for group in &groups {
+        if let Some(idx) = find_listed_for_group(&listed, group) {
+            attach_group(&mut listed[idx], group);
+            used[idx] = true;
+        }
+    }
+
+    let mut attached = vec![false; groups.len()];
+    for (gi, group) in groups.iter().enumerate() {
+        if find_listed_for_group(&listed, group).is_some() {
+            attached[gi] = true;
+        }
+    }
+
+    for (gi, group) in groups.iter().enumerate() {
+        if attached[gi] {
+            continue;
+        }
+        if let Some(idx) = find_cwd_attach(&listed, &used, group) {
+            attach_group(&mut listed[idx], group);
+            used[idx] = true;
+            attached[gi] = true;
+        }
+    }
+
+    let leftover_listed: Vec<usize> = used
+        .iter()
+        .enumerate()
+        .filter(|(_, taken)| !**taken)
+        .map(|(i, _)| i)
+        .collect();
+    let leftover_groups: Vec<usize> = attached
+        .iter()
+        .enumerate()
+        .filter(|(_, taken)| !**taken)
+        .map(|(i, _)| i)
+        .collect();
+    if leftover_listed.len() == 1 && leftover_groups.len() == 1 {
+        let gi = leftover_groups[0];
+        if groups[gi].runner_id().is_none() {
+            let idx = leftover_listed[0];
+            attach_group(&mut listed[idx], &groups[gi]);
+            attached[gi] = true;
+        }
+    }
+
+    for (gi, group) in groups.iter().enumerate() {
+        if !attached[gi] {
+            extras.push(runner_from_group(group));
+        }
+    }
+
+    listed.extend(extras);
+    listed.sort_by(|a, b| a.display_id().cmp(b.display_id()));
+    listed
+}
+
+#[derive(Debug, Clone)]
+struct LocalGroup {
+    procs: Vec<LocalProcess>,
+}
+
+impl LocalGroup {
+    fn runner_id(&self) -> Option<&str> {
+        self.procs.iter().find_map(|p| {
+            p.runner_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+    }
+
+    fn contains_pid(&self, pid: u32) -> bool {
+        self.procs.iter().any(|p| p.pid == pid)
+    }
+
+    fn cwd(&self) -> Option<PathBuf> {
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for proc in &self.procs {
+            if let Some(cwd) = &proc.cwd {
+                if !seen.iter().any(|p| p == cwd) {
+                    seen.push(cwd.clone());
+                }
+            }
+        }
+        if seen.len() == 1 {
+            seen.pop()
+        } else {
+            self.procs.iter().find_map(|p| p.cwd.clone())
+        }
+    }
+}
+
+fn collapse_listed_runners(listed: Vec<Runner>) -> Vec<Runner> {
+    let mut out: Vec<Runner> = Vec::new();
+    for runner in listed {
+        let idx = out.iter().position(|existing| {
+            (!runner.id.is_empty()
+                && !existing.id.is_empty()
+                && existing.id.eq_ignore_ascii_case(&runner.id))
+                || (runner.pid.is_some() && existing.pid == runner.pid)
+        });
+        if let Some(idx) = idx {
+            merge_listed_into(&mut out[idx], runner);
+        } else {
+            out.push(runner);
+        }
+    }
+    out
+}
+
+fn merge_listed_into(dst: &mut Runner, src: Runner) {
+    if dst.id.is_empty() {
+        dst.id = src.id;
+    }
+    if dst.pid.is_none() {
+        dst.pid = src.pid;
+    }
+    if dst.cwd.is_none() {
+        dst.cwd = src.cwd.clone();
+    }
+    for dir in src.dirs {
+        push_unique_dir(&mut dst.dirs, dir);
+    }
+    dst.from_amp_list = dst.from_amp_list || src.from_amp_list;
+    dst.from_local_scan = dst.from_local_scan || src.from_local_scan;
+}
+
+fn group_local_processes(local: &[LocalProcess], spawned: &[LocalProcess]) -> Vec<LocalGroup> {
+    let mut procs: Vec<LocalProcess> = Vec::new();
     for extra in local.iter().chain(spawned) {
-        if let Some(existing) = find_match(&mut runners, extra) {
-            if existing.pid.is_none() {
-                existing.pid = Some(extra.pid);
+        if extra.pid == 0 {
+            continue;
+        }
+        if let Some(existing) = procs.iter_mut().find(|p| p.pid == extra.pid) {
+            if existing.runner_id.is_none() {
+                existing.runner_id = extra.runner_id.clone();
             }
             if existing.cwd.is_none() {
                 existing.cwd = extra.cwd.clone();
             }
+            if existing.ppid.is_none() {
+                existing.ppid = extra.ppid;
+            }
             for dir in &extra.extra_dirs {
-                push_unique_dir(&mut existing.dirs, dir.clone());
+                push_unique_dir(&mut existing.extra_dirs, dir.clone());
             }
-            if extra.cwd.is_some() {
-                if let Some(cwd) = &extra.cwd {
-                    push_unique_dir(&mut existing.dirs, cwd.clone());
-                }
+            continue;
+        }
+        procs.push(extra.clone());
+    }
+
+    let n = procs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if same_runner_id(&procs[i], &procs[j]) {
+                uf_union(&mut parent, i, j);
             }
-            existing.from_local_scan = true;
-        } else {
-            let mut dirs = extra.extra_dirs.clone();
-            if let Some(cwd) = &extra.cwd {
-                push_unique_dir(&mut dirs, cwd.clone());
-            }
-            runners.push(Runner {
-                id: extra.runner_id.clone().unwrap_or_default(),
-                pid: Some(extra.pid),
-                cwd: extra.cwd.clone(),
-                dirs,
-                from_amp_list: false,
-                from_local_scan: true,
-            });
         }
     }
-    runners.sort_by(|a, b| a.display_id().cmp(b.display_id()));
-    runners
+
+    let by_pid: HashMap<u32, usize> = procs
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.pid > 0)
+        .map(|(i, p)| (p.pid, i))
+        .collect();
+    for i in 0..n {
+        if let Some(ppid) = procs[i].ppid {
+            if let Some(&j) = by_pid.get(&ppid) {
+                if ids_compatible(&procs[i], &procs[j]) {
+                    uf_union(&mut parent, i, j);
+                }
+            }
+        }
+        let root = tree_root_index(i, &procs, &by_pid);
+        if ids_compatible(&procs[i], &procs[root]) {
+            uf_union(&mut parent, i, root);
+        }
+    }
+
+    let mut buckets: HashMap<usize, Vec<LocalProcess>> = HashMap::new();
+    for (i, proc) in procs.iter().enumerate() {
+        buckets
+            .entry(uf_find(&mut parent, i))
+            .or_default()
+            .push(proc.clone());
+    }
+    buckets
+        .into_values()
+        .map(|procs| LocalGroup { procs })
+        .collect()
 }
 
-fn find_match<'a>(runners: &'a mut [Runner], local: &LocalProcess) -> Option<&'a mut Runner> {
-    if let Some(id) = local.runner_id.as_deref() {
-        if let Some(idx) = runners
+fn same_runner_id(a: &LocalProcess, b: &LocalProcess) -> bool {
+    match (norm_runner_id(a), norm_runner_id(b)) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        _ => false,
+    }
+}
+
+fn ids_compatible(a: &LocalProcess, b: &LocalProcess) -> bool {
+    match (norm_runner_id(a), norm_runner_id(b)) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        _ => true,
+    }
+}
+
+fn norm_runner_id(proc: &LocalProcess) -> Option<&str> {
+    proc.runner_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let ra = uf_find(parent, a);
+    let rb = uf_find(parent, b);
+    if ra != rb {
+        parent[rb] = ra;
+    }
+}
+
+fn tree_root_index(start: usize, procs: &[LocalProcess], by_pid: &HashMap<u32, usize>) -> usize {
+    let mut idx = start;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(idx) {
+            break;
+        }
+        let Some(ppid) = procs[idx].ppid else {
+            break;
+        };
+        let Some(&parent_idx) = by_pid.get(&ppid) else {
+            break;
+        };
+        if !ids_compatible(&procs[idx], &procs[parent_idx]) {
+            break;
+        }
+        idx = parent_idx;
+    }
+    idx
+}
+
+fn find_listed_for_group(listed: &[Runner], group: &LocalGroup) -> Option<usize> {
+    if let Some(id) = group.runner_id() {
+        if let Some(idx) = listed
             .iter()
             .position(|r| !r.id.is_empty() && r.id.eq_ignore_ascii_case(id))
         {
-            return Some(&mut runners[idx]);
+            return Some(idx);
         }
     }
-    if local.pid > 0 {
-        if let Some(idx) = runners.iter().position(|r| r.pid == Some(local.pid)) {
-            return Some(&mut runners[idx]);
+    for proc in &group.procs {
+        if proc.pid > 0 {
+            if let Some(idx) = listed.iter().position(|r| r.pid == Some(proc.pid)) {
+                return Some(idx);
+            }
         }
     }
     None
+}
+
+fn find_cwd_attach(listed: &[Runner], used: &[bool], group: &LocalGroup) -> Option<usize> {
+    if group.runner_id().is_some() {
+        return None;
+    }
+    let cwd = group.cwd()?;
+    let hits: Vec<usize> = listed
+        .iter()
+        .enumerate()
+        .filter(|(i, runner)| {
+            !used[*i]
+                && (runner.cwd.as_ref() == Some(&cwd) || runner.dirs.iter().any(|d| d == &cwd))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if hits.len() == 1 {
+        Some(hits[0])
+    } else {
+        None
+    }
+}
+
+fn attach_group(runner: &mut Runner, group: &LocalGroup) {
+    let listed_pid = runner.pid.filter(|pid| group.contains_pid(*pid));
+    runner.pid = listed_pid.or_else(|| preferred_group_pid(group));
+    if runner.cwd.is_none() {
+        runner.cwd = group.cwd();
+    }
+    if runner.id.is_empty() {
+        if let Some(id) = group.runner_id() {
+            runner.id = id.to_string();
+        }
+    }
+    for proc in &group.procs {
+        for dir in &proc.extra_dirs {
+            push_unique_dir(&mut runner.dirs, dir.clone());
+        }
+        if let Some(cwd) = &proc.cwd {
+            push_unique_dir(&mut runner.dirs, cwd.clone());
+        }
+    }
+    runner.from_local_scan = true;
+}
+
+fn runner_from_group(group: &LocalGroup) -> Runner {
+    let cwd = group.cwd();
+    let mut dirs = Vec::new();
+    for proc in &group.procs {
+        for dir in &proc.extra_dirs {
+            push_unique_dir(&mut dirs, dir.clone());
+        }
+        if let Some(cwd) = &proc.cwd {
+            push_unique_dir(&mut dirs, cwd.clone());
+        }
+    }
+    Runner {
+        id: group.runner_id().unwrap_or_default().to_string(),
+        pid: preferred_group_pid(group),
+        cwd,
+        dirs,
+        from_amp_list: false,
+        from_local_scan: true,
+    }
+}
+
+fn preferred_group_pid(group: &LocalGroup) -> Option<u32> {
+    let by_pid: HashMap<u32, usize> = group
+        .procs
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.pid > 0)
+        .map(|(i, p)| (p.pid, i))
+        .collect();
+    if by_pid.is_empty() {
+        return None;
+    }
+    group
+        .procs
+        .iter()
+        .filter(|p| p.pid > 0)
+        .map(|p| {
+            let idx = by_pid[&p.pid];
+            group.procs[tree_root_index(idx, &group.procs, &by_pid)].pid
+        })
+        .min()
 }
 
 /// Convert a PID to a `kill(2)` target.
@@ -1161,6 +1557,7 @@ fn inspect_linux(pid: u32) -> Result<LocalProcess> {
                 runner_id: flag_value(&args, "--runner-id"),
                 cwd: fs::read_link(proc_dir.join("cwd")).ok(),
                 extra_dirs: flag_values(&args, "--dir"),
+                ppid: linux_ppid(&proc_dir),
             };
             proc.pid = pid;
             return Ok(proc);
@@ -1648,6 +2045,30 @@ mac-mini (pid 4321)
     }
 
     #[test]
+    fn cmdline_detects_node_amp_script() {
+        let args = vec![
+            "/usr/bin/node".into(),
+            "/usr/lib/node_modules/amp/dist/main.js".into(),
+            "--no-tui".into(),
+            "--runner-id".into(),
+            "box".into(),
+        ];
+        let proc = parse_amp_cmdline(&args).unwrap();
+        assert_eq!(proc.runner_id.as_deref(), Some("box"));
+        assert!(parse_amp_cmdline(&["node".into(), "app.js".into(), "--no-tui".into()]).is_none());
+        assert!(parse_amp_cmdline(&["node".into(), "--no-tui".into()]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_ps_line_reads_ppid() {
+        let proc = parse_ps_line("  123  45 /usr/bin/amp --no-tui --runner-id box").unwrap();
+        assert_eq!(proc.pid, 123);
+        assert_eq!(proc.ppid, Some(45));
+        assert_eq!(proc.runner_id.as_deref(), Some("box"));
+    }
+
+    #[test]
     fn split_cmdline_null_separated() {
         let bytes = b"amp\0--no-tui\0--runner-id\0box\0";
         assert_eq!(
@@ -1671,6 +2092,7 @@ mac-mini (pid 4321)
             runner_id: Some("box".into()),
             cwd: Some(PathBuf::from("/work")),
             extra_dirs: Vec::new(),
+            ppid: None,
         }];
         let merged = merge_runners(listed, &local, &[]);
         assert_eq!(merged[0].pid, Some(7));
@@ -1685,6 +2107,7 @@ mac-mini (pid 4321)
             runner_id: Some("solo".into()),
             cwd: Some(PathBuf::from("/tmp")),
             extra_dirs: Vec::new(),
+            ppid: None,
         }];
         let merged = merge_runners(Vec::new(), &local, &[]);
         assert_eq!(merged.len(), 1);
@@ -1752,6 +2175,7 @@ mac-mini (pid 4321)
             runner_id: Some("beta".into()),
             cwd: Some(PathBuf::from("/work")),
             extra_dirs: Vec::new(),
+            ppid: None,
         }];
         let merged = merge_runners(listed, &local, &[]);
         assert_eq!(merged.len(), 2);
@@ -1759,6 +2183,116 @@ mac-mini (pid 4321)
         assert_eq!(alpha.pid, None);
         let beta = merged.iter().find(|r| r.id == "beta").unwrap();
         assert_eq!(beta.pid, Some(99));
+    }
+
+    fn local_proc(
+        pid: u32,
+        runner_id: Option<&str>,
+        cwd: Option<&str>,
+        ppid: Option<u32>,
+    ) -> LocalProcess {
+        LocalProcess {
+            pid,
+            runner_id: runner_id.map(ToOwned::to_owned),
+            cwd: cwd.map(PathBuf::from),
+            extra_dirs: Vec::new(),
+            ppid,
+        }
+    }
+
+    fn listed_runner(id: &str, pid: Option<u32>, cwd: Option<&str>) -> Runner {
+        Runner {
+            id: id.into(),
+            pid,
+            cwd: cwd.map(PathBuf::from),
+            dirs: cwd.map(|c| vec![PathBuf::from(c)]).unwrap_or_default(),
+            from_amp_list: true,
+            from_local_scan: false,
+        }
+    }
+
+    #[test]
+    fn merge_same_runner_id_multiple_pids_is_one_row() {
+        let local = vec![
+            local_proc(10, Some("box"), Some("/work"), Some(1)),
+            local_proc(11, Some("box"), Some("/work"), Some(10)),
+            local_proc(12, Some("Box"), Some("/work"), Some(10)),
+        ];
+        let merged = merge_runners(Vec::new(), &local, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "box");
+        assert_eq!(merged[0].pid, Some(10));
+        assert!(merged[0].from_local_scan);
+    }
+
+    #[test]
+    fn merge_parent_and_child_without_shared_id_is_one_row() {
+        let local = vec![
+            local_proc(200, Some("box"), Some("/srv"), Some(1)),
+            local_proc(201, None, Some("/srv"), Some(200)),
+            local_proc(202, None, Some("/srv"), Some(200)),
+        ];
+        let merged = merge_runners(Vec::new(), &local, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "box");
+        assert_eq!(merged[0].pid, Some(200));
+    }
+
+    #[test]
+    fn merge_amp_listed_plus_local_duplicates_is_one_row() {
+        let listed = vec![listed_runner("mac-mini", None, Some("/work"))];
+        let local = vec![
+            local_proc(50, None, Some("/work"), Some(1)),
+            local_proc(51, None, Some("/work"), Some(50)),
+            local_proc(52, None, Some("/work"), Some(50)),
+        ];
+        let merged = merge_runners(listed, &local, &[]);
+        assert_eq!(
+            merged.len(),
+            1,
+            "listed runner + helper PIDs must be one row"
+        );
+        assert_eq!(merged[0].id, "mac-mini");
+        assert_eq!(merged[0].pid, Some(50));
+        assert!(merged[0].from_amp_list);
+        assert!(merged[0].from_local_scan);
+    }
+
+    #[test]
+    fn merge_keeps_listed_pid_when_it_is_in_the_tree() {
+        let listed = vec![listed_runner("box", Some(101), Some("/work"))];
+        let local = vec![
+            local_proc(100, Some("box"), Some("/work"), Some(1)),
+            local_proc(101, None, Some("/work"), Some(100)),
+            local_proc(102, None, Some("/work"), Some(100)),
+        ];
+        let merged = merge_runners(listed, &local, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pid, Some(101));
+    }
+
+    #[test]
+    fn merge_prefers_tree_root_when_listed_pid_is_stale() {
+        let listed = vec![listed_runner("box", Some(999), Some("/work"))];
+        let local = vec![
+            local_proc(80, Some("box"), Some("/work"), Some(1)),
+            local_proc(81, None, Some("/work"), Some(80)),
+        ];
+        let merged = merge_runners(listed, &local, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pid, Some(80));
+    }
+
+    #[test]
+    fn merge_collapses_duplicate_listed_ids() {
+        let listed = vec![
+            listed_runner("box", Some(3), Some("/a")),
+            listed_runner("box", None, Some("/b")),
+        ];
+        let merged = merge_runners(listed, &[], &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pid, Some(3));
+        assert_eq!(merged[0].dirs.len(), 2);
     }
 
     #[test]
