@@ -1,6 +1,10 @@
 //! Keyboard-first runner manager (ratatui + crossterm).
 
-use crate::amp::{is_plausible_runner_id, stop_pid, AmpClient, Runner, StartOptions};
+use crate::amp::{
+    is_plausible_runner_id, launch_spec_for_restart, restart_start_options, runner_log_path,
+    stop_verified, tail_log_lines, AmpClient, LaunchSpec, Runner, StartHealth, StartOptions,
+    StopOutcome,
+};
 use crate::config::{
     config_path, cycle_choice, Config, StartDefaults, LOG_LEVELS, MODES, VISIBILITIES,
 };
@@ -12,15 +16,16 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(3);
@@ -38,13 +43,13 @@ Navigation
 
 Runners
   s                 start amp --no-tui in a chosen directory
-  x                 stop the selected runner (SIGTERM, then SIGKILL)
-  r                 restart selected runner
+  x                 stop the selected runner (confirms)
+  r                 restart selected runner (confirms)
   g                 refresh `amp runner list`
 
 Directories
   a                 add a served directory (`amp runner dirs add`)
-  d                 remove the selected directory (`amp runner dirs remove`)
+  d                 remove the selected directory (confirms)
 
 Other
   f                 common flags / defaults (saved to config)
@@ -66,6 +71,86 @@ enum Overlay {
     Flags,
     Picker,
     EditField,
+    Confirm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmAction {
+    Stop,
+    Restart,
+    RemoveDir,
+}
+
+enum AmpJob {
+    Refresh,
+    Update,
+    Start {
+        cwd: PathBuf,
+        opts: StartOptions,
+    },
+    Stop {
+        pid: u32,
+        runner_id: Option<String>,
+        display_id: String,
+    },
+    Restart {
+        pid: u32,
+        runner_id: Option<String>,
+        display_id: String,
+        spec: LaunchSpec,
+    },
+    DirsAdd {
+        runner_id: Option<String>,
+        display_id: String,
+        path: PathBuf,
+    },
+    DirsRemove {
+        runner_id: Option<String>,
+        display_id: String,
+        path: PathBuf,
+    },
+    DirsList {
+        runner_id: Option<String>,
+        match_id: String,
+    },
+}
+
+enum AmpEvent {
+    RefreshOk(Vec<Runner>),
+    UpdateOk {
+        out: String,
+        version: Option<String>,
+    },
+    Started {
+        id: String,
+        outcome: crate::amp::StartOutcome,
+    },
+    Stopped {
+        id: String,
+        outcome: StopOutcome,
+        pid: u32,
+    },
+    Restarted {
+        id: String,
+        outcome: crate::amp::StartOutcome,
+    },
+    DirsAddOk {
+        runner_id: Option<String>,
+        id: String,
+        path: PathBuf,
+        out: String,
+    },
+    DirsRemoveOk {
+        runner_id: Option<String>,
+        id: String,
+        path: PathBuf,
+        out: String,
+    },
+    DirsListOk {
+        match_id: String,
+        dirs: Vec<PathBuf>,
+    },
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,45 +228,42 @@ impl FlagField {
 struct PickerEntry {
     label: String,
     path: PathBuf,
-    kind: PickerKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PickerKind {
-    Typed,
-    Special,
-    Recent,
-    Browse,
 }
 
 #[derive(Debug, Clone)]
 struct DirPicker {
     purpose: PickerPurpose,
     input: String,
+    filter_mode: bool,
     browse_root: PathBuf,
     cursor: usize,
     entries: Vec<PickerEntry>,
 }
 
 struct App {
-    client: AmpClient,
     config: Config,
     config_path: PathBuf,
+    config_writable: bool,
     runners: Vec<Runner>,
     selected_runner: usize,
     selected_dir: usize,
     pane: Pane,
     overlay: Overlay,
+    confirm: Option<ConfirmAction>,
     picker: Option<DirPicker>,
     flags: StartDefaults,
     flag_field: FlagField,
     edit_buffer: String,
     log: VecDeque<LogLine>,
     status: String,
+    status_kind: LogKind,
     amp_version: String,
     last_refresh: Instant,
     should_quit: bool,
-    pending_update: bool,
+    busy: bool,
+    help_scroll: u16,
+    job_tx: Sender<AmpJob>,
+    ev_rx: Receiver<AmpEvent>,
 }
 
 struct LogLine {
@@ -190,7 +272,7 @@ struct LogLine {
     kind: LogKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum LogKind {
     Info,
     Ok,
@@ -200,8 +282,21 @@ enum LogKind {
 /// Run the TUI. Restores the terminal on exit or panic.
 pub fn run() -> Result<()> {
     let client = AmpClient::detect()?;
-    let config = Config::load().unwrap_or_default();
     let config_path = config_path();
+    let (config, config_writable, load_error) = match Config::load() {
+        Ok(loaded) => {
+            let writable = loaded.may_write();
+            (loaded.config, writable, None)
+        }
+        Err(err) => (
+            Config::default(),
+            false,
+            Some(format!(
+                "invalid config {} — using defaults in memory, will not overwrite: {err:#}",
+                config_path.display()
+            )),
+        ),
+    };
 
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -216,7 +311,10 @@ pub fn run() -> Result<()> {
         hook(info);
     }));
 
-    let mut app = App::new(client, config, config_path);
+    let mut app = App::new(client, config, config_path, config_writable);
+    if let Some(err) = load_error {
+        app.log(LogKind::Error, err);
+    }
     let result = app_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -225,12 +323,122 @@ pub fn run() -> Result<()> {
     result
 }
 
+fn spawn_amp_worker(client: AmpClient) -> (Sender<AmpJob>, Receiver<AmpEvent>) {
+    let (job_tx, job_rx) = mpsc::channel();
+    let (ev_tx, ev_rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("lazyamp-amp".into())
+        .spawn(move || worker_loop(client, job_rx, ev_tx))
+        .expect("failed to start Amp worker thread");
+    (job_tx, ev_rx)
+}
+
+fn worker_loop(client: AmpClient, jobs: Receiver<AmpJob>, events: Sender<AmpEvent>) {
+    while let Ok(job) = jobs.recv() {
+        let event = run_job(&client, job);
+        if events.send(event).is_err() {
+            break;
+        }
+    }
+}
+
+fn run_job(client: &AmpClient, job: AmpJob) -> AmpEvent {
+    match job {
+        AmpJob::Refresh => match client.list_runners() {
+            Ok(runners) => AmpEvent::RefreshOk(runners),
+            Err(err) => AmpEvent::Failed(format!("refresh failed: {err:#}")),
+        },
+        AmpJob::Update => match client.update() {
+            Ok(out) => {
+                let version = client.version().ok();
+                AmpEvent::UpdateOk { out, version }
+            }
+            Err(err) => AmpEvent::Failed(format!("amp update failed: {err:#}")),
+        },
+        AmpJob::Start { cwd, opts } => {
+            let id = opts
+                .runner_id
+                .clone()
+                .unwrap_or_else(|| "(amp-assigned id)".into());
+            match client.start_runner(&cwd, &opts) {
+                Ok(outcome) => AmpEvent::Started { id, outcome },
+                Err(err) => AmpEvent::Failed(format!("start failed: {err:#}")),
+            }
+        }
+        AmpJob::Stop {
+            pid,
+            runner_id,
+            display_id,
+        } => match stop_verified(pid, runner_id.as_deref()) {
+            Ok(outcome) => AmpEvent::Stopped {
+                id: display_id,
+                outcome,
+                pid,
+            },
+            Err(err) => AmpEvent::Failed(format!("stop failed: {err:#}")),
+        },
+        AmpJob::Restart {
+            pid,
+            runner_id,
+            display_id,
+            spec,
+        } => {
+            if let Err(err) = crate::amp::validate_launch_spec(&spec) {
+                return AmpEvent::Failed(format!("restart aborted (spec invalid): {err:#}"));
+            }
+            match stop_verified(pid, runner_id.as_deref()) {
+                Ok(_) => {
+                    let opts = restart_start_options(&spec);
+                    match client.start_runner(&spec.cwd, &opts) {
+                        Ok(outcome) => AmpEvent::Restarted {
+                            id: display_id,
+                            outcome,
+                        },
+                        Err(err) => AmpEvent::Failed(format!("restart spawn failed: {err:#}")),
+                    }
+                }
+                Err(err) => AmpEvent::Failed(format!("stop before restart failed: {err:#}")),
+            }
+        }
+        AmpJob::DirsAdd {
+            runner_id,
+            display_id,
+            path,
+        } => match client.dirs_add(runner_id.as_deref(), &path) {
+            Ok(out) => AmpEvent::DirsAddOk {
+                runner_id,
+                id: display_id,
+                path,
+                out,
+            },
+            Err(err) => AmpEvent::Failed(format!("dirs add failed: {err:#}")),
+        },
+        AmpJob::DirsRemove {
+            runner_id,
+            display_id,
+            path,
+        } => match client.dirs_remove(runner_id.as_deref(), &path) {
+            Ok(out) => AmpEvent::DirsRemoveOk {
+                runner_id,
+                id: display_id,
+                path,
+                out,
+            },
+            Err(err) => AmpEvent::Failed(format!("dirs remove failed: {err:#}")),
+        },
+        AmpJob::DirsList {
+            runner_id,
+            match_id,
+        } => match client.dirs_list(runner_id.as_deref()) {
+            Ok(dirs) => AmpEvent::DirsListOk { match_id, dirs },
+            Err(err) => AmpEvent::Failed(format!("dirs list failed: {err:#}")),
+        },
+    }
+}
+
 fn app_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
-        if app.pending_update {
-            terminal.draw(|f| draw(f, app))?;
-            app.run_update();
-        }
+        app.drain_events();
         terminal.draw(|f| draw(f, app))?;
         if app.should_quit {
             break;
@@ -242,48 +450,262 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
                 }
             }
         }
-        if app.overlay == Overlay::None && app.last_refresh.elapsed() >= REFRESH_EVERY {
-            app.refresh();
+        if app.overlay == Overlay::None && !app.busy && app.last_refresh.elapsed() >= REFRESH_EVERY
+        {
+            app.request_refresh();
         }
     }
-    let _ = app.config.save_to(&app.config_path);
+    if app.config_writable {
+        let _ = app.config.save_to(&app.config_path);
+    }
     Ok(())
 }
 
 impl App {
-    fn new(client: AmpClient, config: Config, config_path: PathBuf) -> Self {
+    fn new(client: AmpClient, config: Config, config_path: PathBuf, config_writable: bool) -> Self {
         let flags = config.defaults.clone();
         let amp_version = client.version().unwrap_or_else(|_| "unknown".into());
+        let binary = client.binary.display().to_string();
+        let (job_tx, ev_rx) = spawn_amp_worker(client);
         let mut app = Self {
-            client,
             config,
             config_path,
+            config_writable,
             runners: Vec::new(),
             selected_runner: 0,
             selected_dir: 0,
             pane: Pane::Runners,
             overlay: Overlay::None,
+            confirm: None,
             picker: None,
             flags,
             flag_field: FlagField::RunnerId,
             edit_buffer: String::new(),
             log: VecDeque::new(),
             status: "ready".into(),
+            status_kind: LogKind::Info,
             amp_version,
             last_refresh: Instant::now() - REFRESH_EVERY,
             should_quit: false,
-            pending_update: false,
+            busy: false,
+            help_scroll: 0,
+            job_tx,
+            ev_rx,
         };
         app.log(
             LogKind::Info,
-            format!(
-                "Amp {} — {}",
-                amp_version_label(&app.amp_version),
-                app.client.binary.display()
-            ),
+            format!("Amp {} — {binary}", amp_version_label(&app.amp_version)),
         );
-        app.refresh();
+        if !app.config_writable {
+            app.log(
+                LogKind::Error,
+                format!(
+                    "config {} is invalid; changes will not be saved",
+                    app.config_path.display()
+                ),
+            );
+        }
+        app.request_refresh();
         app
+    }
+
+    fn submit(&mut self, job: AmpJob, working: impl Into<String>) {
+        if self.busy {
+            self.log(LogKind::Info, "already working…");
+            return;
+        }
+        let working = working.into();
+        self.busy = true;
+        self.status = working.clone();
+        self.status_kind = LogKind::Info;
+        if self.job_tx.send(job).is_err() {
+            self.busy = false;
+            self.log(LogKind::Error, "Amp worker thread is gone");
+        }
+    }
+
+    fn request_refresh(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.submit(AmpJob::Refresh, "working… refresh");
+    }
+
+    fn maybe_save_config(&mut self) {
+        if !self.config_writable {
+            return;
+        }
+        if let Err(err) = self.config.save_to(&self.config_path) {
+            self.log(LogKind::Error, format!("save failed: {err:#}"));
+        }
+    }
+
+    fn drain_events(&mut self) {
+        loop {
+            match self.ev_rx.try_recv() {
+                Ok(event) => self.handle_event(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.busy = false;
+                    self.log(LogKind::Error, "Amp worker thread disconnected");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_event(&mut self, event: AmpEvent) {
+        self.busy = false;
+        match event {
+            AmpEvent::RefreshOk(list) => {
+                let current_id = self.current_runner().map(|r| r.id.clone());
+                let current_dir = self.selected_dir_path();
+                self.runners = list;
+                self.reselect(current_id.as_deref(), current_dir.as_deref());
+                if self.status_kind != LogKind::Error {
+                    self.status = format!("{} runner(s)", self.runners.len());
+                    self.status_kind = LogKind::Info;
+                }
+                self.last_refresh = Instant::now();
+            }
+            AmpEvent::UpdateOk { out, version } => {
+                let summary = summarize_output(&out);
+                self.log(LogKind::Ok, format!("amp update: {summary}"));
+                if let Some(v) = version {
+                    self.amp_version = v;
+                }
+            }
+            AmpEvent::Started { id, outcome } => {
+                self.config.remember_dir(&outcome.cwd);
+                self.maybe_save_config();
+                self.log_start_outcome("started", &id, &outcome);
+                self.request_refresh();
+            }
+            AmpEvent::Stopped { id, outcome, pid } => {
+                match outcome {
+                    StopOutcome::Stopped => {
+                        self.log(LogKind::Ok, format!("stopped {id} (pid {pid})"));
+                    }
+                    StopOutcome::AlreadyGone => {
+                        self.log(
+                            LogKind::Info,
+                            format!("pid {pid} for {id} was already gone"),
+                        );
+                    }
+                }
+                self.request_refresh();
+            }
+            AmpEvent::Restarted { id, outcome } => {
+                self.log_start_outcome("restarted", &id, &outcome);
+                self.request_refresh();
+            }
+            AmpEvent::DirsAddOk {
+                runner_id,
+                id,
+                path,
+                out,
+            } => {
+                self.config.remember_dir(&path);
+                self.maybe_save_config();
+                self.log(
+                    LogKind::Ok,
+                    format!(
+                        "added {} to {id} {}",
+                        display_path(&path),
+                        first_line_or_empty(&out)
+                    )
+                    .trim()
+                    .to_string(),
+                );
+                self.submit(
+                    AmpJob::DirsList {
+                        runner_id,
+                        match_id: id,
+                    },
+                    "working… dirs",
+                );
+            }
+            AmpEvent::DirsRemoveOk {
+                runner_id,
+                id,
+                path,
+                out,
+            } => {
+                self.log(
+                    LogKind::Ok,
+                    format!(
+                        "removed {} from {id} {}",
+                        display_path(&path),
+                        first_line_or_empty(&out)
+                    )
+                    .trim()
+                    .to_string(),
+                );
+                self.submit(
+                    AmpJob::DirsList {
+                        runner_id,
+                        match_id: id,
+                    },
+                    "working… dirs",
+                );
+            }
+            AmpEvent::DirsListOk { match_id, dirs } => {
+                if !dirs.is_empty() {
+                    if let Some(r) = self
+                        .runners
+                        .iter_mut()
+                        .find(|r| r.id.eq_ignore_ascii_case(&match_id))
+                    {
+                        r.dirs = dirs;
+                    }
+                } else {
+                    self.request_refresh();
+                }
+                if self.selected_dir >= self.current_dirs().len() {
+                    self.selected_dir = self.current_dirs().len().saturating_sub(1);
+                }
+            }
+            AmpEvent::Failed(err) => self.log(LogKind::Error, err),
+        }
+    }
+
+    fn log_start_outcome(&mut self, verb: &str, id: &str, outcome: &crate::amp::StartOutcome) {
+        let log = display_path(&outcome.log_path);
+        match &outcome.health {
+            StartHealth::Listed => self.log(
+                LogKind::Ok,
+                format!("{verb} {id} (pid {}, listed)  log {log}", outcome.pid),
+            ),
+            StartHealth::Alive => self.log(
+                LogKind::Info,
+                format!(
+                    "spawned {id} (pid {}) — not yet in `amp runner list`; log {log}",
+                    outcome.pid
+                ),
+            ),
+            StartHealth::NeedsLogin => self.log(
+                LogKind::Error,
+                format!(
+                    "Amp at pid {} is waiting for login. Run `amp login` in a terminal. log {log}",
+                    outcome.pid
+                ),
+            ),
+            StartHealth::Exited { hint } => {
+                let hint = hint.trim();
+                let extra = if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {hint}")
+                };
+                self.log(
+                    LogKind::Error,
+                    format!(
+                        "{id} exited immediately (pid {}). See {log}{extra}",
+                        outcome.pid
+                    ),
+                );
+            }
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -296,11 +718,18 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
                     self.overlay = Overlay::None;
                 }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
                 _ => {}
             },
             Overlay::Flags => self.handle_flags_key(key),
             Overlay::Picker => self.handle_picker_key(key),
             Overlay::EditField => self.handle_edit_key(key),
+            Overlay::Confirm => self.handle_confirm_key(key),
             Overlay::None => self.handle_normal_key(key),
         }
     }
@@ -315,15 +744,14 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.pane = Pane::Dirs,
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
-            KeyCode::Char('g') => self.refresh(),
+            KeyCode::Char('g') => self.request_refresh(),
             KeyCode::Char('s') => self.open_picker(PickerPurpose::Start),
-            KeyCode::Char('x') => self.stop_selected(),
-            KeyCode::Char('r') => self.restart_selected(),
+            KeyCode::Char('x') => self.ask_confirm(ConfirmAction::Stop),
+            KeyCode::Char('r') => self.ask_confirm(ConfirmAction::Restart),
             KeyCode::Char('a') => self.open_picker(PickerPurpose::AddDir),
-            KeyCode::Char('d') => self.remove_selected_dir(),
+            KeyCode::Char('d') => self.ask_confirm(ConfirmAction::RemoveDir),
             KeyCode::Char('u') => {
-                self.status = "Running `amp update`…".into();
-                self.pending_update = true;
+                self.submit(AmpJob::Update, "working… amp update");
             }
             KeyCode::Char('f') => {
                 self.flags = self.config.defaults.clone();
@@ -367,46 +795,62 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => {
-                self.picker = None;
-                self.overlay = Overlay::None;
+                if picker.filter_mode || !picker.input.is_empty() {
+                    picker.input.clear();
+                    picker.filter_mode = false;
+                    picker.cursor = 0;
+                    rebuild_picker(picker, &self.config);
+                } else {
+                    self.picker = None;
+                    self.overlay = Overlay::None;
+                }
             }
             KeyCode::Enter => {
-                if let Some(entry) = picker.entries.get(picker.cursor).cloned() {
-                    let path = entry.path;
+                let path = picker_selected_path(picker).or_else(|| {
+                    if picker.input.trim().is_empty() {
+                        None
+                    } else {
+                        Some(expand_path(picker.input.trim()))
+                    }
+                });
+                if let Some(path) = path {
                     let purpose = picker.purpose;
                     self.picker = None;
                     self.overlay = Overlay::None;
                     self.finish_picker(purpose, path);
                 }
             }
-            KeyCode::Char('l') | KeyCode::Right
-                if key.modifiers.is_empty() && picker.input.is_empty() =>
-            {
+            KeyCode::Right => {
                 if let Some(entry) = picker.entries.get(picker.cursor).cloned() {
                     if entry.path.is_dir() {
                         picker.browse_root = entry.path;
-                        picker.input.clear();
                         picker.cursor = 0;
                         rebuild_picker(picker, &self.config);
                     }
                 }
             }
-            KeyCode::Char('h') | KeyCode::Left
-                if key.modifiers.is_empty() && picker.input.is_empty() =>
-            {
+            KeyCode::Left => {
                 if let Some(parent) = picker.browse_root.parent() {
                     picker.browse_root = parent.to_path_buf();
                     picker.cursor = 0;
                     rebuild_picker(picker, &self.config);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') if picker.input.is_empty() => {
-                if picker.cursor + 1 < picker.entries.len() {
-                    picker.cursor += 1;
+            KeyCode::Char('l') if key.modifiers.is_empty() && !picker.filter_mode => {
+                if let Some(entry) = picker.entries.get(picker.cursor).cloned() {
+                    if entry.path.is_dir() {
+                        picker.browse_root = entry.path;
+                        picker.cursor = 0;
+                        rebuild_picker(picker, &self.config);
+                    }
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') if picker.input.is_empty() => {
-                picker.cursor = picker.cursor.saturating_sub(1);
+            KeyCode::Char('h') if key.modifiers.is_empty() && !picker.filter_mode => {
+                if let Some(parent) = picker.browse_root.parent() {
+                    picker.browse_root = parent.to_path_buf();
+                    picker.cursor = 0;
+                    rebuild_picker(picker, &self.config);
+                }
             }
             KeyCode::Down => {
                 if picker.cursor + 1 < picker.entries.len() {
@@ -416,12 +860,32 @@ impl App {
             KeyCode::Up => {
                 picker.cursor = picker.cursor.saturating_sub(1);
             }
+            KeyCode::Char('j') if key.modifiers.is_empty() && !picker.filter_mode => {
+                if picker.cursor + 1 < picker.entries.len() {
+                    picker.cursor += 1;
+                }
+            }
+            KeyCode::Char('k') if key.modifiers.is_empty() && !picker.filter_mode => {
+                picker.cursor = picker.cursor.saturating_sub(1);
+            }
+            KeyCode::Char('/') if key.modifiers.is_empty() && !picker.filter_mode => {
+                picker.filter_mode = true;
+            }
             KeyCode::Backspace => {
                 picker.input.pop();
+                if picker.input.is_empty() {
+                    picker.filter_mode = false;
+                }
+                picker.cursor = 0;
                 rebuild_picker(picker, &self.config);
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && picker_char_is_filter(picker.filter_mode, c) =>
+            {
+                picker.filter_mode = true;
                 picker.input.push(c);
+                picker.cursor = 0;
                 rebuild_picker(picker, &self.config);
             }
             _ => {}
@@ -506,6 +970,16 @@ impl App {
                 return;
             }
         }
+        if !self.config_writable {
+            self.log(
+                LogKind::Error,
+                format!(
+                    "refusing to write invalid config {}",
+                    self.config_path.display()
+                ),
+            );
+            return;
+        }
         self.config.defaults = self.flags.clone();
         match self.config.save_to(&self.config_path) {
             Ok(()) => {
@@ -570,6 +1044,7 @@ impl App {
         let mut picker = DirPicker {
             purpose,
             input: String::new(),
+            filter_mode: false,
             browse_root,
             cursor: 0,
             entries: Vec::new(),
@@ -609,22 +1084,60 @@ impl App {
             }
         }
         let opts = self.start_options();
-        match self.client.start_runner(cwd, &opts) {
-            Ok(pid) => {
-                self.config.remember_dir(cwd);
-                let _ = self.config.save_to(&self.config_path);
-                let id = opts
-                    .runner_id
-                    .clone()
-                    .unwrap_or_else(|| "(amp-assigned id)".into());
-                self.log(
-                    LogKind::Ok,
-                    format!("started {id} in {} (pid {pid})", display_path(cwd)),
-                );
-                self.status = format!("started pid {pid}");
-                self.refresh();
+        self.submit(
+            AmpJob::Start {
+                cwd: cwd.to_path_buf(),
+                opts,
+            },
+            format!("working… start in {}", display_path(cwd)),
+        );
+    }
+
+    fn ask_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::Stop | ConfirmAction::Restart => {
+                if self.current_runner().is_none() {
+                    self.log(LogKind::Error, "no runner selected");
+                    return;
+                }
             }
-            Err(err) => self.log(LogKind::Error, format!("start failed: {err:#}")),
+            ConfirmAction::RemoveDir => {
+                if self.current_runner().is_none() {
+                    self.log(LogKind::Error, "no runner selected");
+                    return;
+                }
+                if self.selected_dir_path().is_none() {
+                    self.log(LogKind::Error, "no directory selected");
+                    return;
+                }
+            }
+        }
+        self.confirm = Some(action);
+        self.overlay = Overlay::Confirm;
+    }
+
+    fn handle_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                self.confirm = None;
+                self.overlay = Overlay::None;
+            }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                let action = self.confirm.take();
+                self.overlay = Overlay::None;
+                if let Some(action) = action {
+                    self.perform_confirm(action);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn perform_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::Stop => self.stop_selected(),
+            ConfirmAction::Restart => self.restart_selected(),
+            ConfirmAction::RemoveDir => self.remove_selected_dir(),
         }
     }
 
@@ -634,16 +1147,14 @@ impl App {
             return;
         };
         match resolve_stop_pid(&runner) {
-            Some(pid) => match stop_pid(pid) {
-                Ok(()) => {
-                    self.log(
-                        LogKind::Ok,
-                        format!("stopped {} (pid {pid})", runner.display_id()),
-                    );
-                    self.refresh();
-                }
-                Err(err) => self.log(LogKind::Error, format!("stop failed: {err:#}")),
-            },
+            Some(pid) => self.submit(
+                AmpJob::Stop {
+                    pid,
+                    runner_id: runner.runner_id_flag().map(str::to_string),
+                    display_id: runner.display_id().to_string(),
+                },
+                format!("working… stop {}", runner.display_id()),
+            ),
             None => self.log(
                 LogKind::Error,
                 format!(
@@ -659,49 +1170,29 @@ impl App {
             self.log(LogKind::Error, "no runner selected");
             return;
         };
-        let cwd = runner.cwd.clone().or_else(|| runner.dirs.first().cloned());
-        let Some(cwd) = cwd else {
-            self.log(
-                LogKind::Error,
-                "cannot restart: no working directory known for this runner",
-            );
-            return;
-        };
-        if let Some(pid) = resolve_stop_pid(&runner) {
-            if let Err(err) = stop_pid(pid) {
-                self.log(
-                    LogKind::Error,
-                    format!("stop before restart failed: {err:#}"),
-                );
+        let spec = match launch_spec_for_restart(&runner) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.log(LogKind::Error, format!("cannot restart: {err:#}"));
                 return;
             }
-        } else {
+        };
+        let Some(pid) = resolve_stop_pid(&runner) else {
             self.log(
                 LogKind::Error,
                 "cannot restart: no PID (see README for PID detection)",
             );
             return;
-        }
-        let mut opts = self.start_options();
-        if opts.runner_id.is_none() {
-            if let Some(id) = runner.runner_id_flag() {
-                opts.runner_id = Some(id.to_string());
-            }
-        }
-        match self.client.start_runner(&cwd, &opts) {
-            Ok(pid) => {
-                self.log(
-                    LogKind::Ok,
-                    format!(
-                        "restarted {} in {} (pid {pid})",
-                        runner.display_id(),
-                        display_path(&cwd)
-                    ),
-                );
-                self.refresh();
-            }
-            Err(err) => self.log(LogKind::Error, format!("restart spawn failed: {err:#}")),
-        }
+        };
+        self.submit(
+            AmpJob::Restart {
+                pid,
+                runner_id: runner.runner_id_flag().map(str::to_string),
+                display_id: runner.display_id().to_string(),
+                spec,
+            },
+            format!("working… restart {}", runner.display_id()),
+        );
     }
 
     fn add_dir(&mut self, path: &Path) {
@@ -709,25 +1200,14 @@ impl App {
             self.log(LogKind::Error, "no runner selected");
             return;
         };
-        match self.client.dirs_add(runner.runner_id_flag(), path) {
-            Ok(out) => {
-                self.config.remember_dir(path);
-                let _ = self.config.save_to(&self.config_path);
-                self.log(
-                    LogKind::Ok,
-                    format!(
-                        "added {} to {} {}",
-                        display_path(path),
-                        runner.display_id(),
-                        first_line_or_empty(&out)
-                    )
-                    .trim()
-                    .to_string(),
-                );
-                self.refresh_dirs_for(&runner);
-            }
-            Err(err) => self.log(LogKind::Error, format!("dirs add failed: {err:#}")),
-        }
+        self.submit(
+            AmpJob::DirsAdd {
+                runner_id: runner.runner_id_flag().map(str::to_string),
+                display_id: runner.display_id().to_string(),
+                path: path.to_path_buf(),
+            },
+            format!("working… add {}", display_path(path)),
+        );
     }
 
     fn remove_selected_dir(&mut self) {
@@ -739,75 +1219,14 @@ impl App {
             self.log(LogKind::Error, "no directory selected");
             return;
         };
-        match self.client.dirs_remove(runner.runner_id_flag(), &path) {
-            Ok(out) => {
-                self.log(
-                    LogKind::Ok,
-                    format!(
-                        "removed {} from {} {}",
-                        display_path(&path),
-                        runner.display_id(),
-                        first_line_or_empty(&out)
-                    )
-                    .trim()
-                    .to_string(),
-                );
-                self.refresh_dirs_for(&runner);
-            }
-            Err(err) => self.log(LogKind::Error, format!("dirs remove failed: {err:#}")),
-        }
-    }
-
-    fn refresh_dirs_for(&mut self, runner: &Runner) {
-        match self.client.dirs_list(runner.runner_id_flag()) {
-            Ok(dirs) if !dirs.is_empty() => {
-                if let Some(r) = self
-                    .runners
-                    .iter_mut()
-                    .find(|r| r.id.eq_ignore_ascii_case(&runner.id))
-                {
-                    r.dirs = dirs;
-                }
-            }
-            _ => self.refresh(),
-        }
-        if self.selected_dir >= self.current_dirs().len() {
-            self.selected_dir = self.current_dirs().len().saturating_sub(1);
-        }
-    }
-
-    fn run_update(&mut self) {
-        self.pending_update = false;
-        match self.client.update() {
-            Ok(out) => {
-                let summary = summarize_output(&out);
-                self.log(LogKind::Ok, format!("amp update: {summary}"));
-                self.status = "amp update finished".into();
-                if let Ok(v) = self.client.version() {
-                    self.amp_version = v;
-                }
-            }
-            Err(err) => {
-                self.log(LogKind::Error, format!("amp update failed: {err:#}"));
-                self.status = "amp update failed".into();
-            }
-        }
-    }
-
-    fn refresh(&mut self) {
-        let current_id = self.current_runner().map(|r| r.id.clone());
-        let current_dir = self.selected_dir_path();
-        match self.client.list_runners() {
-            Ok(list) => {
-                self.runners = list;
-                self.reselect(current_id.as_deref(), current_dir.as_deref());
-                self.status = format!("{} runner(s)", self.runners.len());
-            }
-            Err(err) => {
-                self.log(LogKind::Error, format!("refresh failed: {err:#}"));
-            }
-        }
-        self.last_refresh = Instant::now();
+        self.submit(
+            AmpJob::DirsRemove {
+                runner_id: runner.runner_id_flag().map(str::to_string),
+                display_id: runner.display_id().to_string(),
+                path,
+            },
+            format!("working… remove dir from {}", runner.display_id()),
+        );
     }
 
     fn reselect(&mut self, id: Option<&str>, dir: Option<&Path>) {
@@ -837,6 +1256,7 @@ impl App {
         let text = text.into();
         let time = Local::now().format("%H:%M:%S").to_string();
         self.status = text.clone();
+        self.status_kind = kind;
         self.log.push_back(LogLine { time, text, kind });
         while self.log.len() > LOG_CAP {
             self.log.pop_front();
@@ -848,29 +1268,28 @@ fn resolve_stop_pid(runner: &Runner) -> Option<u32> {
     runner.pid.filter(|pid| *pid > 0)
 }
 
+fn picker_char_is_filter(filter_mode: bool, c: char) -> bool {
+    filter_mode || !matches!(c, 'h' | 'j' | 'k' | 'l')
+}
+
+fn picker_selected_path(picker: &DirPicker) -> Option<PathBuf> {
+    picker.entries.get(picker.cursor).map(|e| e.path.clone())
+}
+
 fn rebuild_picker(picker: &mut DirPicker, config: &Config) {
     let query = picker.input.trim();
     let mut entries = Vec::new();
     let typed = expand_path(query);
-    if !query.is_empty() {
-        entries.push(PickerEntry {
-            label: format!("use {}", display_path(&typed)),
-            path: typed,
-            kind: PickerKind::Typed,
-        });
-    }
     if let Ok(cwd) = std::env::current_dir() {
         entries.push(PickerEntry {
             label: format!("current  {}", display_path(&cwd)),
             path: cwd,
-            kind: PickerKind::Special,
         });
     }
     if let Some(home) = dirs::home_dir() {
         entries.push(PickerEntry {
             label: format!("home     {}", display_path(&home)),
             path: home,
-            kind: PickerKind::Special,
         });
     }
     for recent in &config.recent_dirs {
@@ -878,14 +1297,12 @@ fn rebuild_picker(picker: &mut DirPicker, config: &Config) {
         entries.push(PickerEntry {
             label: format!("recent   {}", display_path(&path)),
             path,
-            kind: PickerKind::Recent,
         });
     }
     if let Some(parent) = picker.browse_root.parent() {
         entries.push(PickerEntry {
             label: format!("..       {}", display_path(parent)),
             path: parent.to_path_buf(),
-            kind: PickerKind::Browse,
         });
     }
     for child in list_subdirs(&picker.browse_root) {
@@ -896,20 +1313,22 @@ fn rebuild_picker(picker: &mut DirPicker, config: &Config) {
         entries.push(PickerEntry {
             label: format!("browse   {name}/"),
             path: child,
-            kind: PickerKind::Browse,
         });
     }
     if !query.is_empty() {
         entries.retain(|e| {
-            e.kind == PickerKind::Typed
-                || fuzzy_match(query, &e.label)
-                || fuzzy_match(query, &e.path.to_string_lossy())
+            fuzzy_match(query, &e.label) || fuzzy_match(query, &e.path.to_string_lossy())
         });
+        if typed.is_dir() && !entries.iter().any(|e| e.path == typed) {
+            entries.push(PickerEntry {
+                label: format!("exact    {}", display_path(&typed)),
+                path: typed,
+            });
+        }
     }
-    // Dedup paths, keep first occurrence (typed/special/recent beat browse).
     let mut seen = Vec::new();
     entries.retain(|e| {
-        if seen.iter().any(|p| p == &e.path) && e.kind != PickerKind::Typed {
+        if seen.iter().any(|p| p == &e.path) {
             false
         } else {
             seen.push(e.path.clone());
@@ -1085,13 +1504,14 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     draw_status(frame, chunks[3], app);
 
     match app.overlay {
-        Overlay::Help => draw_help(frame, area),
+        Overlay::Help => draw_help(frame, area, app),
         Overlay::Flags => draw_flags(frame, area, app),
         Overlay::Picker => draw_picker(frame, area, app),
         Overlay::EditField => {
             draw_flags(frame, area, app);
             draw_edit(frame, area, app);
         }
+        Overlay::Confirm => draw_confirm(frame, area, app),
         Overlay::None => {}
     }
 }
@@ -1127,7 +1547,12 @@ fn draw_main(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(area);
     draw_runners(frame, cols[0], app);
-    draw_dirs(frame, cols[1], app);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(cols[1]);
+    draw_dirs(frame, right[0], app);
+    draw_runner_log(frame, right[1], app);
 }
 
 fn pane_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
@@ -1162,28 +1587,35 @@ fn draw_runners(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
         .runners
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let marker = if i == app.selected_runner { ">" } else { " " };
+        .map(|r| {
             let pid = r
                 .pid
                 .map(|p| format!("pid {p}"))
                 .unwrap_or_else(|| "pid ?".into());
             let n = r.dirs.len();
-            let src = if r.from_amp_list { "amp" } else { "local" };
+            let health = runner_health_label(r);
             let line = format!(
-                "{marker} {:<20}  {pid:<12}  {n} dir{}  [{src}]",
+                "{:<20}  {pid:<12}  {n} dir{}  {health}",
                 truncate(r.display_id(), 20),
                 if n == 1 { "" } else { "s" }
             );
-            let mut style = Style::default();
-            if i == app.selected_runner {
-                style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-            }
-            ListItem::new(line).style(style)
+            ListItem::new(line)
         })
         .collect();
-    frame.render_widget(List::new(items).block(block), area);
+    let mut state = ListState::default();
+    state.select(Some(app.selected_runner));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> "),
+        area,
+        &mut state,
+    );
 }
 
 fn draw_dirs(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -1204,17 +1636,58 @@ fn draw_dirs(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     }
     let items: Vec<ListItem> = dirs
         .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let marker = if i == app.selected_dir { ">" } else { " " };
-            let mut style = Style::default();
-            if i == app.selected_dir {
-                style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-            }
-            ListItem::new(format!("{marker} {}", display_path(d))).style(style)
-        })
+        .map(|d| ListItem::new(display_path(d)))
         .collect();
-    frame.render_widget(List::new(items).block(block), area);
+    let mut state = ListState::default();
+    state.select(Some(app.selected_dir));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> "),
+        area,
+        &mut state,
+    );
+}
+
+fn runner_health_label(runner: &Runner) -> &'static str {
+    if runner.from_amp_list {
+        "connected"
+    } else {
+        "local only"
+    }
+}
+
+fn draw_runner_log(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let (title, body) = match app.current_runner() {
+        Some(runner) => {
+            let path = runner_log_path(runner.runner_id_flag(), runner.cwd.as_deref());
+            let lines = tail_log_lines(&path, 8);
+            let title = format!(" runner log · {} ", display_path(&path));
+            let body = if lines.is_empty() {
+                format!("(empty or missing)\n{}", path.display())
+            } else {
+                lines.join("\n")
+            };
+            (title, body)
+        }
+        None => (
+            " runner log ".into(),
+            "Select a runner to see its last log lines.".into(),
+        ),
+    };
+    let block = pane_block(&title, false);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(Style::default().fg(Color::Gray))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_log(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -1250,13 +1723,16 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let style = if app.status.to_ascii_lowercase().contains("fail")
-        || app.status.to_ascii_lowercase().contains("not found")
-        || app.status.to_ascii_lowercase().contains("could not")
-    {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::Gray)
+    let style = match app.status_kind {
+        LogKind::Error => Style::default().fg(Color::Red),
+        LogKind::Ok => Style::default().fg(Color::Green),
+        LogKind::Info => {
+            if app.busy {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            }
+        }
     };
     frame.render_widget(
         Paragraph::new(format!(" {}", app.status)).style(style),
@@ -1264,17 +1740,18 @@ fn draw_status(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
+fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let popup = centered(area, 72, 80);
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(" help  (esc) ")
+        .title(" help  (esc · j/k scroll) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(
         Paragraph::new(HELP_TEXT)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((app.help_scroll, 0)),
         popup,
     );
 }
@@ -1343,48 +1820,107 @@ fn draw_picker(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         PickerPurpose::Start => " start runner · pick working directory ",
         PickerPurpose::AddDir => " add directory to selected runner ",
     };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(2),
-        ])
-        .split(popup);
     let outer = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(outer, popup);
+    let inner = popup.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(inner);
 
+    let mode = if picker.filter_mode { "filter" } else { "nav" };
     let input = Paragraph::new(format!("{}_", picker.input)).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" filter / path "),
+            .title(format!(" {mode} / path ")),
     );
-    let inner_input = shrink(chunks[0], 1, 1);
-    frame.render_widget(input, inner_input);
+    frame.render_widget(input, chunks[0]);
 
     let items: Vec<ListItem> = picker
         .entries
         .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let marker = if i == picker.cursor { ">" } else { " " };
-            let mut style = Style::default();
-            if i == picker.cursor {
-                style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-            }
-            ListItem::new(format!("{marker} {}", e.label)).style(style)
-        })
+        .map(|e| ListItem::new(e.label.clone()))
         .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" matches "));
-    frame.render_widget(list, shrink(chunks[1], 1, 0));
+    let mut state = ListState::default();
+    if !picker.entries.is_empty() {
+        state.select(Some(picker.cursor.min(picker.entries.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" matches "))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> "),
+        chunks[1],
+        &mut state,
+    );
 
-    let hint = Paragraph::new("enter select · ←/h parent · →/l browse · type to filter")
+    let hint = Paragraph::new("/ filter · hjkl/arrows move (nav) · enter select highlighted")
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(hint, shrink(chunks[2], 1, 0));
+    frame.render_widget(hint, chunks[2]);
+}
+
+fn draw_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(action) = app.confirm else {
+        return;
+    };
+    let popup = centered(area, 60, 24);
+    frame.render_widget(Clear, popup);
+    let question = match action {
+        ConfirmAction::Stop => {
+            let id = app
+                .current_runner()
+                .map(|r| r.display_id().to_string())
+                .unwrap_or_else(|| "?".into());
+            format!("Stop runner `{id}`?  SIGTERM then SIGKILL if needed.")
+        }
+        ConfirmAction::Restart => {
+            let id = app
+                .current_runner()
+                .map(|r| r.display_id().to_string())
+                .unwrap_or_else(|| "?".into());
+            format!("Restart runner `{id}` using its saved launch spec?")
+        }
+        ConfirmAction::RemoveDir => {
+            let path = app
+                .selected_dir_path()
+                .map(|p| display_path(&p))
+                .unwrap_or_else(|| "?".into());
+            format!("Remove directory `{path}` from the selected runner?")
+        }
+    };
+    let block = Block::default()
+        .title(" confirm  (y/enter · n/esc) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(question),
+            Line::from(""),
+            Line::from(Span::styled(
+                "y / Enter  confirm     n / Esc  cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block)
+        .wrap(Wrap { trim: true }),
+        popup,
+    );
 }
 
 fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
@@ -1404,17 +1940,6 @@ fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
             Constraint::Percentage((100 - width_pct) / 2),
         ])
         .split(v[1])[1]
-}
-
-fn shrink(area: Rect, x: u16, y: u16) -> Rect {
-    let x = x.min(area.width / 2);
-    let y = y.min(area.height / 2);
-    Rect {
-        x: area.x + x,
-        y: area.y + y,
-        width: area.width.saturating_sub(x * 2),
-        height: area.height.saturating_sub(y * 2),
-    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1451,5 +1976,14 @@ mod tests {
     fn amp_version_label_strips_prefix() {
         assert_eq!(amp_version_label("amp 0.0.0-stub"), "0.0.0-stub");
         assert_eq!(amp_version_label("1.2.3"), "1.2.3");
+    }
+
+    #[test]
+    fn picker_hjkl_type_in_filter_mode_only() {
+        assert!(!picker_char_is_filter(false, 'h'));
+        assert!(!picker_char_is_filter(false, 'j'));
+        assert!(picker_char_is_filter(false, 's'));
+        assert!(picker_char_is_filter(true, 'h'));
+        assert!(picker_char_is_filter(true, 'l'));
     }
 }
