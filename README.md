@@ -23,9 +23,28 @@ Related Amp settings (not edited by lazyamp): `amp.runner.autoUpdate.enabled`, `
 
 ## Install
 
+Linux and macOS (`x86_64` / `aarch64`), from [GitHub Releases](https://github.com/miltonparedes/lazyamp/releases):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | sh
+```
+
+Installs to `~/.local/bin`, or `/usr/local/bin` if writable. Pin a version or prefix:
+
+```bash
+VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | sh -s -- --prefix /usr/local
+```
+
+The script verifies `sha256` from `checksums.txt` when that file is attached to the release.
+
+From source:
+
 ```bash
 cargo install --path .
 ```
+
+Or download a `lazyamp-<version>-<target>.tar.gz` from [Releases](https://github.com/miltonparedes/lazyamp/releases) and put `lazyamp` on `PATH`.
 
 ## Usage
 
@@ -92,9 +111,19 @@ Runner logs and a spawn-PID registry live under `$XDG_STATE_HOME/lazyamp/` (usua
 
 Stop sends `SIGTERM`, then `SIGKILL` if the process is still alive. Started runners call `setsid()` so they keep running after you quit lazyamp.
 
+## Releasing
+
+`Cargo.toml` `version` must match the tag (for `0.1.0` use `v0.1.0`):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That tag push builds Linux and macOS archives, publishes a GitHub Release, and uploads `checksums.txt`.
+
 ## Future
 
-- Packaged GitHub Release binaries
 - Auto-updating lazyamp itself
 - Orbs / Amp Net / thread browsing (out of scope)
 
