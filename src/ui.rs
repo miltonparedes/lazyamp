@@ -276,7 +276,11 @@ impl App {
         };
         app.log(
             LogKind::Info,
-            format!("Amp {} — {}", app.amp_version, app.client.binary.display()),
+            format!(
+                "Amp {} — {}",
+                amp_version_label(&app.amp_version),
+                app.client.binary.display()
+            ),
         );
         app.refresh();
         app
@@ -1034,6 +1038,10 @@ fn flag_value_display(flags: &StartDefaults, field: FlagField) -> String {
     }
 }
 
+fn amp_version_label(v: &str) -> &str {
+    v.trim().strip_prefix("amp ").unwrap_or(v.trim())
+}
+
 fn on_off(v: bool) -> String {
     if v {
         "on".into()
@@ -1101,7 +1109,10 @@ fn draw_title(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("amp "),
-        Span::styled(&app.amp_version, Style::default().fg(Color::Green)),
+        Span::styled(
+            amp_version_label(&app.amp_version),
+            Style::default().fg(Color::Green),
+        ),
         Span::styled(
             "   q quit  ? help  s start  x stop  r restart  f flags  u update",
             Style::default().fg(Color::DarkGray),
@@ -1434,5 +1445,11 @@ mod tests {
             assert_eq!(expand_path("~/code"), home.join("code"));
         }
         assert_eq!(expand_path("/tmp/x"), PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn amp_version_label_strips_prefix() {
+        assert_eq!(amp_version_label("amp 0.0.0-stub"), "0.0.0-stub");
+        assert_eq!(amp_version_label("1.2.3"), "1.2.3");
     }
 }

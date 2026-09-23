@@ -1284,4 +1284,79 @@ mac-mini (pid 4321)
         }
         assert_eq!(resolve_executable(&bin), Some(bin));
     }
+
+    #[cfg(unix)]
+    fn write_amp_stub(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("amp");
+        fs::write(&bin, script).unwrap();
+        let mut p = fs::metadata(&bin).unwrap().permissions();
+        p.set_mode(0o755);
+        fs::set_permissions(&bin, p).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_uses_stub_amp_for_list_dirs_and_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_amp_stub(
+            tmp.path(),
+            r#"#!/bin/sh
+case "$1" in
+  version) echo "amp 0.0.0-stub"; exit 0 ;;
+  update) echo "Already up to date"; exit 0 ;;
+  runner)
+    if [ "$2" = "list" ]; then
+      echo '[{"id":"stub-box","pid":4242,"dirs":["/tmp/work"]}]'
+      exit 0
+    fi
+    if [ "$2" = "dirs" ] && [ "$3" = "list" ]; then
+      echo "/tmp/work"
+      echo "/tmp/extra"
+      exit 0
+    fi
+    if [ "$2" = "dirs" ] && [ "$3" = "add" ]; then
+      echo "added"
+      exit 0
+    fi
+    if [ "$2" = "dirs" ] && [ "$3" = "remove" ]; then
+      echo "removed"
+      exit 0
+    fi
+    ;;
+esac
+echo "unexpected: $*" >&2
+exit 1
+"#,
+        );
+        let client = AmpClient { binary: bin };
+        assert_eq!(client.version().unwrap(), "amp 0.0.0-stub");
+        assert!(client.update().unwrap().contains("Already up to date"));
+        let runners = client.list_runners().unwrap();
+        let stub = runners
+            .iter()
+            .find(|r| r.id == "stub-box")
+            .expect("stub runner from amp runner list --json");
+        assert_eq!(stub.pid, Some(4242));
+        assert_eq!(stub.dirs, vec![PathBuf::from("/tmp/work")]);
+        assert_eq!(
+            client.dirs_list(Some("stub-box")).unwrap(),
+            vec![PathBuf::from("/tmp/work"), PathBuf::from("/tmp/extra")]
+        );
+        assert_eq!(
+            client
+                .dirs_add(Some("stub-box"), Path::new("/tmp/new"))
+                .unwrap()
+                .trim(),
+            "added"
+        );
+        assert_eq!(
+            client
+                .dirs_remove(Some("stub-box"), Path::new("/tmp/extra"))
+                .unwrap()
+                .trim(),
+            "removed"
+        );
+    }
 }
