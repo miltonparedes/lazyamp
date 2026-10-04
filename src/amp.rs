@@ -454,9 +454,11 @@ fn runner_from_json(value: Value) -> Option<Runner> {
             dirs.push(PathBuf::from(dir));
         }
     }
-    if let Some(cwd) = &cwd {
-        if !dirs.iter().any(|d| d == cwd) {
-            dirs.insert(0, cwd.clone());
+    if map.get("serveCwd").and_then(Value::as_bool) != Some(false) {
+        if let Some(cwd) = &cwd {
+            if !dirs.iter().any(|d| d == cwd) {
+                dirs.insert(0, cwd.clone());
+            }
         }
     }
     if id.is_empty() && pid.is_none() && dirs.is_empty() {
@@ -508,12 +510,7 @@ fn first_string_list(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec
     for key in keys {
         if let Some(v) = map.get(*key) {
             match v {
-                Value::Array(arr) => {
-                    return arr
-                        .iter()
-                        .filter_map(|item| item.as_str().map(PathBuf::from))
-                        .collect();
-                }
+                Value::Array(_) => return json_dirs(v.clone()),
                 Value::String(s) => return split_dir_list(s),
                 _ => {}
             }
@@ -1327,14 +1324,7 @@ fn attach_group(runner: &mut Runner, group: &LocalGroup) {
             runner.id = id.to_string();
         }
     }
-    for proc in &group.procs {
-        for dir in &proc.extra_dirs {
-            push_unique_dir(&mut runner.dirs, dir.clone());
-        }
-        if let Some(cwd) = &proc.cwd {
-            push_unique_dir(&mut runner.dirs, cwd.clone());
-        }
-    }
+    // The live list owns served directories; argv may contain relative or stale paths.
     runner.from_local_scan = true;
 }
 
@@ -1731,6 +1721,12 @@ pub fn validate_launch_spec(spec: &LaunchSpec) -> Result<()> {
     if !spec.cwd.is_dir() {
         bail!("launch cwd does not exist: {}", spec.cwd.display());
     }
+    for dir in &spec.options.extra_dirs {
+        let path = spec.cwd.join(dir);
+        if !path.is_dir() {
+            bail!("served directory does not exist: {}", path.display());
+        }
+    }
     if let Some(id) = spec
         .options
         .runner_id
@@ -1751,6 +1747,73 @@ pub fn restart_start_options(spec: &LaunchSpec) -> StartOptions {
         opts.runner_id = spec.runner_id.clone();
     }
     opts
+}
+
+/// Removing the launch cwd requires a restart, unlike a directory added live.
+/// Plan it before confirmation so no process is stopped without a valid replacement.
+pub fn removal_restart_spec(
+    runner: &Runner,
+    path: &Path,
+    saved: Option<LaunchSpec>,
+) -> Result<Option<LaunchSpec>> {
+    let Some(cwd) = runner.cwd.as_deref() else {
+        return Ok(None);
+    };
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if resolved_dir(path, &cwd) != cwd {
+        return Ok(None);
+    }
+    if !runner.from_amp_list {
+        bail!("refresh the runner's served directories before changing its primary directory");
+    }
+    let mut spec = saved.ok_or_else(|| {
+        anyhow!(
+            "cannot change primary directory safely without a saved launch spec; restart manually"
+        )
+    })?;
+    if resolved_dir(&spec.cwd, &cwd) != cwd {
+        bail!("saved launch cwd differs from the running runner; restart manually");
+    }
+    if spec.options.discover_dirs {
+        bail!("changing primary directory with --discover-dirs requires a manual restart");
+    }
+    let id = runner
+        .runner_id_flag()
+        .ok_or_else(|| anyhow!("cannot change primary directory without a known runner-id"))?;
+    let mut remaining = Vec::new();
+    for dir in &runner.dirs {
+        let dir = resolved_dir(dir, &cwd);
+        if dir != cwd {
+            push_unique_dir(&mut remaining, dir);
+        }
+    }
+    let next = remaining
+        .iter()
+        .position(|dir| dir.is_dir())
+        .ok_or_else(|| {
+            anyhow!("cannot remove the last usable directory; add another served directory first")
+        })?;
+    spec.cwd = remaining.remove(next);
+    spec.runner_id = Some(id.to_string());
+    spec.options.runner_id = spec.runner_id.clone();
+    // Live additions belong to the old cwd in Amp's registry. Carry the full live
+    // list explicitly, and never reinterpret old relative --dir paths in the new cwd.
+    spec.options.extra_dirs = remaining;
+    if let Some(path) = spec.options.settings_file.as_mut() {
+        *path = cwd.join(&*path).display().to_string();
+    }
+    if let Some(value) = spec.options.mcp_config.as_mut() {
+        if serde_json::from_str::<Value>(value).is_err() {
+            *value = cwd.join(&*value).display().to_string();
+        }
+    }
+    validate_launch_spec(&spec)?;
+    Ok(Some(spec))
+}
+
+fn resolved_dir(path: &Path, cwd: &Path) -> PathBuf {
+    let absolute = cwd.join(path);
+    fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
 /// Resolve the spec used to restart `runner`. Prefers the saved launch spec,
@@ -1973,6 +2036,31 @@ mod tests {
         assert_eq!(runners[0].id, "box");
         assert_eq!(runners[0].pid, Some(99));
         assert_eq!(runners[0].cwd, Some(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn listed_directories_are_authoritative_including_serve_cwd() {
+        for serve_cwd in [true, false] {
+            let raw = format!(
+                r#"{{"runners":[{{
+                "runnerId":"box", "workingDirectory":"/work", "serveCwd":{serve_cwd},
+                "directories":[{{"path":"/work/alpha"}}, {{"path":"/other/beta"}}]
+            }}]}}"#
+            );
+            let mut proc = local_proc(123, Some("box"), Some("/work"), None);
+            proc.extra_dirs = vec![PathBuf::from("alpha"), PathBuf::from("stale")];
+            let runners = merge_runners(parse_runner_list(&raw).unwrap(), &[proc], &[]);
+            let expected = if serve_cwd {
+                vec!["/work", "/work/alpha", "/other/beta"]
+            } else {
+                vec!["/work/alpha", "/other/beta"]
+            };
+            assert_eq!(
+                runners[0].dirs,
+                expected.into_iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
+            assert_eq!(runners[0].pid, Some(123));
+        }
     }
 
     #[test]
@@ -2324,6 +2412,108 @@ mac-mini (pid 4321)
         );
         assert_ne!(opts.mode.as_deref(), Some("low"));
         assert_ne!(opts.runner_id.as_deref(), Some("beta"));
+    }
+
+    fn removal_fixture(root: &Path) -> (Runner, LaunchSpec) {
+        let cwd = root.join("primary");
+        let next = cwd.join("project");
+        let extra = root.join("extra");
+        let live = root.join("added-live");
+        for dir in [&next, &extra, &live] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let mut runner = listed_runner("box", Some(123), cwd.to_str());
+        runner.dirs.extend([next, extra, live]);
+        let spec = LaunchSpec {
+            runner_id: Some("box".into()),
+            cwd,
+            options: StartOptions {
+                runner_id: Some("box".into()),
+                mode: Some("high".into()),
+                remote_control_terminal: true,
+                amp_env: true,
+                settings_file: Some("config/settings.json".into()),
+                mcp_config: Some("config/mcp.json".into()),
+                extra_dirs: vec![PathBuf::from("project"), PathBuf::from("../extra")],
+                ..StartOptions::default()
+            },
+        };
+        (runner, spec)
+    }
+
+    #[test]
+    fn removing_primary_rehomes_and_preserves_live_dirs_and_saved_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (runner, saved) = removal_fixture(&root);
+        let old_cwd = root.join("primary");
+        let spec = removal_restart_spec(&runner, &old_cwd, Some(saved.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.cwd, old_cwd.join("project"));
+        assert_eq!(spec.runner_id.as_deref(), Some("box"));
+        let mut expected = saved.options;
+        expected.extra_dirs = vec![root.join("extra"), root.join("added-live")];
+        expected.settings_file = Some(old_cwd.join("config/settings.json").display().to_string());
+        expected.mcp_config = Some(old_cwd.join("config/mcp.json").display().to_string());
+        assert_eq!(spec.options, expected);
+    }
+
+    #[test]
+    fn removing_primary_preserves_inline_mcp_and_deduplicates_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (mut runner, mut saved) = removal_fixture(&root);
+        let cwd = saved.cwd.clone();
+        let alias = root.join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cwd, &alias).unwrap();
+        #[cfg(not(unix))]
+        let alias = cwd.clone();
+        runner.dirs.push(alias.clone());
+        runner.dirs.push(alias.join("project"));
+        let mcp = r#"{"mcpServers":{}}"#;
+        saved.options.mcp_config = Some(mcp.into());
+        let spec = removal_restart_spec(&runner, &alias, Some(saved))
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.cwd, cwd.join("project"));
+        assert_eq!(
+            spec.options.extra_dirs,
+            vec![root.join("extra"), root.join("added-live")]
+        );
+        assert_eq!(spec.options.mcp_config.as_deref(), Some(mcp));
+    }
+
+    #[test]
+    fn removing_primary_requires_a_safe_replacement_and_known_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut runner, saved) = removal_fixture(tmp.path());
+        let cwd = saved.cwd.clone();
+        assert!(removal_restart_spec(&runner, &cwd, None)
+            .unwrap_err()
+            .to_string()
+            .contains("saved launch spec"));
+        let mut discovery = saved.clone();
+        discovery.options.discover_dirs = true;
+        assert!(removal_restart_spec(&runner, &cwd, Some(discovery)).is_err());
+        runner.dirs = vec![cwd.clone(), tmp.path().join("missing")];
+        assert!(removal_restart_spec(&runner, &cwd, Some(saved.clone()))
+            .unwrap_err()
+            .to_string()
+            .contains("last usable directory"));
+        runner.dirs = vec![cwd.clone()];
+        assert!(removal_restart_spec(&runner, &cwd, Some(saved)).is_err());
+    }
+
+    #[test]
+    fn removing_non_primary_stays_live_without_a_saved_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runner, _) = removal_fixture(tmp.path());
+        assert_eq!(
+            removal_restart_spec(&runner, &runner.dirs[1], None).unwrap(),
+            None
+        );
     }
 
     #[test]

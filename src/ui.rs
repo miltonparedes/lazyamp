@@ -1,9 +1,9 @@
 //! Keyboard-first runner manager (ratatui + crossterm).
 
 use crate::amp::{
-    is_plausible_runner_id, launch_spec_for_restart, restart_start_options, runner_log_path,
-    stop_verified, tail_log_lines, AmpClient, LaunchSpec, Runner, StartHealth, StartOptions,
-    StopOutcome,
+    find_launch_spec, is_plausible_runner_id, launch_spec_for_restart, removal_restart_spec,
+    restart_start_options, runner_log_path, stop_verified, tail_log_lines, AmpClient, LaunchSpec,
+    Runner, StartHealth, StartOptions, StopOutcome,
 };
 use crate::config::{
     config_path, cycle_choice, Config, StartDefaults, LOG_LEVELS, MODES, VISIBILITIES,
@@ -82,11 +82,15 @@ enum Overlay {
     Confirm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfirmAction {
     Stop,
     Restart,
-    RemoveDir,
+    RemoveDir {
+        runner: Runner,
+        path: PathBuf,
+        restart: Option<Box<LaunchSpec>>,
+    },
 }
 
 enum AmpJob {
@@ -117,10 +121,6 @@ enum AmpJob {
         display_id: String,
         path: PathBuf,
     },
-    DirsList {
-        runner_id: Option<String>,
-        match_id: String,
-    },
 }
 
 enum AmpEvent {
@@ -143,20 +143,14 @@ enum AmpEvent {
         outcome: crate::amp::StartOutcome,
     },
     DirsAddOk {
-        runner_id: Option<String>,
         id: String,
         path: PathBuf,
         out: String,
     },
     DirsRemoveOk {
-        runner_id: Option<String>,
         id: String,
         path: PathBuf,
         out: String,
-    },
-    DirsListOk {
-        match_id: String,
-        dirs: Vec<PathBuf>,
     },
     Failed(String),
 }
@@ -467,7 +461,6 @@ fn run_job(client: &AmpClient, job: AmpJob) -> AmpEvent {
             path,
         } => match client.dirs_add(runner_id.as_deref(), &path) {
             Ok(out) => AmpEvent::DirsAddOk {
-                runner_id,
                 id: display_id,
                 path,
                 out,
@@ -480,19 +473,11 @@ fn run_job(client: &AmpClient, job: AmpJob) -> AmpEvent {
             path,
         } => match client.dirs_remove(runner_id.as_deref(), &path) {
             Ok(out) => AmpEvent::DirsRemoveOk {
-                runner_id,
                 id: display_id,
                 path,
                 out,
             },
             Err(err) => AmpEvent::Failed(format!("dirs remove failed: {err:#}")),
-        },
-        AmpJob::DirsList {
-            runner_id,
-            match_id,
-        } => match client.dirs_list(runner_id.as_deref()) {
-            Ok(dirs) => AmpEvent::DirsListOk { match_id, dirs },
-            Err(err) => AmpEvent::Failed(format!("dirs list failed: {err:#}")),
         },
     }
 }
@@ -734,12 +719,7 @@ impl App {
                 self.log_start_outcome("restarted", &id, &outcome);
                 self.request_refresh();
             }
-            AmpEvent::DirsAddOk {
-                runner_id,
-                id,
-                path,
-                out,
-            } => {
+            AmpEvent::DirsAddOk { id, path, out } => {
                 self.config.remember_dir(&path);
                 self.maybe_save_config();
                 self.log(
@@ -752,20 +732,9 @@ impl App {
                     .trim()
                     .to_string(),
                 );
-                self.submit(
-                    AmpJob::DirsList {
-                        runner_id,
-                        match_id: id,
-                    },
-                    "working… dirs",
-                );
+                self.request_refresh();
             }
-            AmpEvent::DirsRemoveOk {
-                runner_id,
-                id,
-                path,
-                out,
-            } => {
+            AmpEvent::DirsRemoveOk { id, path, out } => {
                 self.log(
                     LogKind::Ok,
                     format!(
@@ -776,29 +745,7 @@ impl App {
                     .trim()
                     .to_string(),
                 );
-                self.submit(
-                    AmpJob::DirsList {
-                        runner_id,
-                        match_id: id,
-                    },
-                    "working… dirs",
-                );
-            }
-            AmpEvent::DirsListOk { match_id, dirs } => {
-                if !dirs.is_empty() {
-                    if let Some(r) = self
-                        .runners
-                        .iter_mut()
-                        .find(|r| r.id.eq_ignore_ascii_case(&match_id))
-                    {
-                        r.dirs = dirs;
-                    }
-                } else {
-                    self.request_refresh();
-                }
-                if self.selected_dir >= self.current_dirs().len() {
-                    self.selected_dir = self.current_dirs().len().saturating_sub(1);
-                }
+                self.request_refresh();
             }
             AmpEvent::Failed(err) => self.log(LogKind::Error, err),
         }
@@ -884,7 +831,7 @@ impl App {
             KeyCode::Char('x') => self.ask_confirm(ConfirmAction::Stop),
             KeyCode::Char('r') => self.ask_confirm(ConfirmAction::Restart),
             KeyCode::Char('a') => self.open_picker(PickerPurpose::AddDir),
-            KeyCode::Char('d') => self.ask_confirm(ConfirmAction::RemoveDir),
+            KeyCode::Char('d') => self.ask_remove_dir(),
             KeyCode::Char('u') => {
                 self.submit(AmpJob::Update, "working… amp update");
             }
@@ -1232,26 +1179,50 @@ impl App {
     }
 
     fn ask_confirm(&mut self, action: ConfirmAction) {
-        match action {
-            ConfirmAction::Stop | ConfirmAction::Restart => {
-                if self.current_runner().is_none() {
-                    self.log(LogKind::Error, "no runner selected");
-                    return;
-                }
-            }
-            ConfirmAction::RemoveDir => {
-                if self.current_runner().is_none() {
-                    self.log(LogKind::Error, "no runner selected");
-                    return;
-                }
-                if self.selected_dir_path().is_none() {
-                    self.log(LogKind::Error, "no directory selected");
-                    return;
-                }
-            }
+        if self.current_runner().is_none() {
+            self.log(LogKind::Error, "no runner selected");
+            return;
         }
         self.confirm = Some(action);
         self.overlay = Overlay::Confirm;
+    }
+
+    fn ask_remove_dir(&mut self) {
+        if self.busy {
+            self.log(
+                LogKind::Info,
+                "wait for the current operation before removing a directory",
+            );
+            return;
+        }
+        let Some(runner) = self.current_runner().cloned() else {
+            self.log(LogKind::Error, "no runner selected");
+            return;
+        };
+        let Some(path) = self.selected_dir_path() else {
+            self.log(LogKind::Error, "no directory selected");
+            return;
+        };
+        let saved = find_launch_spec(runner.runner_id_flag(), runner.cwd.as_deref());
+        let restart = match removal_restart_spec(&runner, &path, saved) {
+            Ok(spec) => spec.map(Box::new),
+            Err(err) => {
+                self.log(LogKind::Error, format!("cannot remove directory: {err:#}"));
+                return;
+            }
+        };
+        if restart.is_some() && resolve_stop_pid(&runner).is_none() {
+            self.log(
+                LogKind::Error,
+                "cannot change primary directory: no verified local PID",
+            );
+            return;
+        }
+        self.ask_confirm(ConfirmAction::RemoveDir {
+            runner,
+            path,
+            restart,
+        });
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) {
@@ -1275,7 +1246,13 @@ impl App {
         match action {
             ConfirmAction::Stop => self.stop_selected(),
             ConfirmAction::Restart => self.restart_selected(),
-            ConfirmAction::RemoveDir => self.remove_selected_dir(),
+            ConfirmAction::RemoveDir {
+                runner,
+                path,
+                restart,
+            } => {
+                self.remove_dir(runner, path, restart.map(|spec| *spec));
+            }
         }
     }
 
@@ -1348,15 +1325,31 @@ impl App {
         );
     }
 
-    fn remove_selected_dir(&mut self) {
-        let Some(runner) = self.current_runner().cloned() else {
-            self.log(LogKind::Error, "no runner selected");
+    fn remove_dir(&mut self, runner: Runner, path: PathBuf, restart: Option<LaunchSpec>) {
+        if let Some(spec) = restart {
+            let Some(pid) = resolve_stop_pid(&runner) else {
+                self.log(
+                    LogKind::Error,
+                    "cannot change primary directory: no local PID",
+                );
+                return;
+            };
+            let message = format!(
+                "working… remove {} and restart in {}",
+                display_path(&path),
+                display_path(&spec.cwd)
+            );
+            self.submit(
+                AmpJob::Restart {
+                    pid,
+                    runner_id: runner.runner_id_flag().map(str::to_string),
+                    display_id: runner.display_id().to_string(),
+                    spec,
+                },
+                message,
+            );
             return;
-        };
-        let Some(path) = self.selected_dir_path() else {
-            self.log(LogKind::Error, "no directory selected");
-            return;
-        };
+        }
         self.submit(
             AmpJob::DirsRemove {
                 runner_id: runner.runner_id_flag().map(str::to_string),
@@ -2018,10 +2011,20 @@ fn draw_picker(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let Some(action) = app.confirm else {
+    let Some(action) = app.confirm.as_ref() else {
         return;
     };
-    let popup = centered(area, 60, 24);
+    let popup = if matches!(
+        action,
+        ConfirmAction::RemoveDir {
+            restart: Some(_),
+            ..
+        }
+    ) {
+        centered(area, 80, 60)
+    } else {
+        centered(area, 60, 24)
+    };
     frame.render_widget(Clear, popup);
     let question = match action {
         ConfirmAction::Stop => {
@@ -2038,12 +2041,25 @@ fn draw_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 .unwrap_or_else(|| "?".into());
             format!("Restart runner `{id}` using its saved launch spec?")
         }
-        ConfirmAction::RemoveDir => {
-            let path = app
-                .selected_dir_path()
-                .map(|p| display_path(&p))
-                .unwrap_or_else(|| "?".into());
-            format!("Remove served directory `{path}` from the selected runner?")
+        ConfirmAction::RemoveDir {
+            runner,
+            path,
+            restart,
+        } => {
+            if let Some(spec) = restart {
+                format!(
+                    "Remove primary directory `{}` from `{}`? New primary: `{}`. \
+                     This RESTARTS the runner and interrupts active threads. \
+                     The remaining served directories and saved flags are kept. No files are deleted.",
+                    display_path(path), runner.display_id(), display_path(&spec.cwd),
+                )
+            } else {
+                format!(
+                    "Remove served directory `{}` from `{}`?",
+                    display_path(path),
+                    runner.display_id()
+                )
+            }
         }
     };
     let block = Block::default()
@@ -2128,5 +2144,137 @@ mod tests {
         assert!(picker_char_is_filter(false, 's'));
         assert!(picker_char_is_filter(true, 'h'));
         assert!(picker_char_is_filter(true, 'l'));
+    }
+
+    fn test_app() -> (App, Receiver<AmpJob>) {
+        let (job_tx, jobs) = mpsc::channel();
+        let (_, ev_rx) = mpsc::channel();
+        let (picker_tx, _) = mpsc::channel();
+        let (_, picker_rx) = mpsc::channel();
+        (
+            App {
+                config: Config::default(),
+                config_path: PathBuf::new(),
+                config_writable: false,
+                runners: Vec::new(),
+                selected_runner: 0,
+                selected_dir: 0,
+                pane: Pane::Dirs,
+                overlay: Overlay::None,
+                confirm: None,
+                picker: None,
+                flags: StartDefaults::default(),
+                flag_field: FlagField::RunnerId,
+                edit_buffer: String::new(),
+                log: VecDeque::new(),
+                status: String::new(),
+                status_kind: LogKind::Info,
+                amp_version: String::new(),
+                last_refresh: Instant::now(),
+                should_quit: false,
+                busy: false,
+                help_scroll: 0,
+                job_tx,
+                ev_rx,
+                picker_tx,
+                picker_rx,
+            },
+            jobs,
+        )
+    }
+
+    #[test]
+    fn directory_confirmation_can_cancel_and_keeps_the_confirmed_target() {
+        for restart in [false, true] {
+            let (mut app, jobs) = test_app();
+            let runner = Runner {
+                id: "confirmed-box".into(),
+                pid: Some(4321),
+                cwd: Some(PathBuf::from("/old")),
+                dirs: vec![PathBuf::from("/old"), PathBuf::from("/next")],
+                from_amp_list: true,
+                from_local_scan: true,
+            };
+            let spec = LaunchSpec {
+                runner_id: Some(runner.id.clone()),
+                cwd: PathBuf::from("/next"),
+                options: StartOptions::default(),
+            };
+            let action = ConfirmAction::RemoveDir {
+                runner: runner.clone(),
+                path: PathBuf::from("/old"),
+                restart: restart.then(|| Box::new(spec.clone())),
+            };
+            app.runners.push(runner);
+            app.ask_confirm(action.clone());
+            assert!(
+                jobs.try_recv().is_err(),
+                "opening confirmation must do no work"
+            );
+            app.handle_confirm_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(app.confirm.is_none());
+            assert!(jobs.try_recv().is_err(), "cancel must do no work");
+            app.ask_confirm(action);
+            app.runners.clear(); // A changed selection must not redirect the confirmed operation.
+            app.handle_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            match jobs.try_recv().unwrap() {
+                AmpJob::Restart {
+                    pid,
+                    runner_id,
+                    spec: actual,
+                    ..
+                } if restart => {
+                    assert_eq!(pid, 4321);
+                    assert_eq!(runner_id.as_deref(), Some("confirmed-box"));
+                    assert_eq!(actual, spec);
+                }
+                AmpJob::DirsRemove {
+                    runner_id, path, ..
+                } if !restart => {
+                    assert_eq!(runner_id.as_deref(), Some("confirmed-box"));
+                    assert_eq!(path, PathBuf::from("/old"));
+                }
+                _ => panic!("wrong removal job"),
+            }
+        }
+    }
+
+    #[test]
+    fn successful_dir_removal_refreshes_the_authoritative_list() {
+        let (mut app, jobs) = test_app();
+        app.handle_event(AmpEvent::DirsRemoveOk {
+            id: "box".into(),
+            path: PathBuf::from("/old"),
+            out: "removed".into(),
+        });
+        assert!(matches!(jobs.try_recv().unwrap(), AmpJob::Refresh));
+    }
+
+    #[test]
+    fn restart_revalidates_remaining_directories_before_stopping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event = run_job(
+            &AmpClient {
+                binary: PathBuf::from("must-not-run"),
+            },
+            AmpJob::Restart {
+                pid: 1, // Even an invalid signal target must not be reached.
+                runner_id: Some("box".into()),
+                display_id: "box".into(),
+                spec: LaunchSpec {
+                    runner_id: Some("box".into()),
+                    cwd: tmp.path().to_path_buf(),
+                    options: StartOptions {
+                        extra_dirs: vec![tmp.path().join("disappeared-after-confirmation")],
+                        ..StartOptions::default()
+                    },
+                },
+            },
+        );
+        let AmpEvent::Failed(error) = event else {
+            panic!("invalid restart succeeded")
+        };
+        assert!(error.contains("restart aborted (spec invalid)"), "{error}");
+        assert!(error.contains("served directory does not exist"), "{error}");
     }
 }

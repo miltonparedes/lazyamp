@@ -255,7 +255,12 @@ pub fn collect_ranked_paths(search: RankedSearch<'_>) -> Vec<RankedPath> {
     let query = search.query.trim();
 
     let mut push = |source: PathSource, path: PathBuf| {
-        if !path.as_os_str().is_empty() && seen.insert(path.clone()) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        // Compare directory identities, but keep the highest-ranked spelling/source.
+        let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.insert(identity) {
             out.push(RankedPath { source, path });
         }
     };
@@ -399,6 +404,85 @@ mod tests {
         assert!(sources.contains(&PathSource::Recent));
         assert!(sources.contains(&PathSource::Nested));
         assert_eq!(ranked[0].path, zox);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ranked_paths_deduplicate_aliases_without_losing_priority_or_distinct_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let real = root.join("real/project");
+        let alias = root.join("alias/project");
+        let other = root.join("other/project");
+        touch_dir(&real);
+        touch_dir(&other);
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+
+        for exact in [None, Some(real.as_path())] {
+            let ranked = collect_ranked_paths(RankedSearch {
+                query: "project",
+                browse_root: root,
+                recent_dirs: &[real.display().to_string()],
+                zoxide_dirs: &[alias.clone(), real.clone()],
+                nested_dirs: &[real.clone(), other.clone()],
+                cwd: Some(&real),
+                home: None,
+                typed_exact: exact,
+                browse_children: false,
+            });
+            let first = if exact.is_some() {
+                RankedPath {
+                    source: PathSource::Exact,
+                    path: real.clone(),
+                }
+            } else {
+                RankedPath {
+                    source: PathSource::Zoxide,
+                    path: alias.clone(),
+                }
+            };
+            assert_eq!(
+                ranked,
+                vec![
+                    first,
+                    RankedPath {
+                        source: PathSource::Nested,
+                        path: other.clone(),
+                    }
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ranked_paths_preserve_unresolvable_paths_and_deduplicate_exact_repeats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("missing-one");
+        let second = tmp.path().join("missing-two");
+        let ranked = collect_ranked_paths(RankedSearch {
+            query: "missing",
+            browse_root: tmp.path(),
+            recent_dirs: &[first.display().to_string(), second.display().to_string()],
+            zoxide_dirs: std::slice::from_ref(&first),
+            nested_dirs: &[],
+            cwd: None,
+            home: None,
+            typed_exact: None,
+            browse_children: false,
+        });
+        assert_eq!(
+            ranked,
+            vec![
+                RankedPath {
+                    source: PathSource::Zoxide,
+                    path: first
+                },
+                RankedPath {
+                    source: PathSource::Recent,
+                    path: second
+                },
+            ]
+        );
     }
 
     #[test]

@@ -78,6 +78,10 @@ Directory picker: `hjkl` browses immediate children of the current folder. `/` o
 
 `s` chooses the runner's start cwd. `a` adds a served directory — a path the runner can see, which is not the same as the start cwd.
 
+Removing the **primary directory** (start cwd) with `d` proposes the first remaining served directory that exists as the new primary. The confirmation names it and warns that this **restarts the runner and interrupts active threads**. No files are deleted. The restart keeps the runner ID, saved flags, and all remaining live served directories, including paths added after launch; relative settings/MCP file paths are resolved against the old cwd. The new launch spec is saved for later restarts.
+
+This requires a saved launch spec, a known local PID, and another usable served directory. Removing the last directory or automatically changing cwd with `--discover-dirs` is refused before stopping anything. Other directory removals still use `amp runner dirs remove`; directories pinned by `--dir` need a manual launch change.
+
 The right pane shows the last lines of the selected runner's log (under `$XDG_STATE_HOME/lazyamp/logs/`). Amp CLI calls run off the UI thread; the status line shows `working…` while they run.
 
 ## Config
