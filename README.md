@@ -1,6 +1,6 @@
 # lazyamp
 
-Terminal UI for managing [Amp](https://ampcode.com/docs/cli) `--no-tui` runners. List, start, stop, restart, add/remove served directories, update the Amp CLI, and persist common start flags.
+Terminal UI for managing [Amp](https://ampcode.com/docs/cli) `--no-tui` runners. List, start, stop, restart, add/remove served directories, follow each runner's activity, update the Amp CLI and lazyamp itself, and persist common start flags. Keyboard first; the mouse works too.
 
 lazyamp does **not** reimplement Amp’s interactive agent TUI.
 
@@ -40,6 +40,8 @@ curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/
 
 The script also reads `VERSION` from the environment when you run `install.sh` directly (`VERSION=v0.1.1 ./scripts/install.sh`). It requires `checksums.txt` and verifies sha256 (set `LAZYAMP_INSECURE_SKIP_VERIFY=1` only as an escape hatch). The binary is staged then renamed to avoid `Text file busy`.
 
+Once installed, update in place with `lazyamp update` (or `U` inside the TUI). Releases up to v0.1.1 lack this command; re-run the install script once to get it.
+
 From source (Rust 1.85+):
 
 ```bash
@@ -51,30 +53,40 @@ Or download a `lazyamp-<version>-<target>.tar.gz` from [Releases](https://github
 ## Usage
 
 ```bash
-lazyamp
+lazyamp                          # open the TUI
+lazyamp update                   # install the latest release if it is newer
+lazyamp update --check           # show current and latest versions
+lazyamp update --version v0.1.1  # install an exact release (rollback)
 ```
+
+`lazyamp update` downloads that release's `install.sh` and runs it against the directory of the running binary, so the same sha256 verification and atomic rename apply. It needs `curl` and write access to that directory. **Running Amp runners are separate processes and keep running**; only lazyamp is replaced. Inside the TUI, a header badge shows when a newer release exists (checked at most once a day, off the UI thread; set `LAZYAMP_NO_UPDATE_CHECK=1` to disable). `U` installs it, then offers to quit so you can start the new version (lazyamp does not re-exec itself: that would orphan the threads that reap runners it started).
 
 ## Keybindings
 
+The footer always shows the keys for the focused pane or dialog; `?` lists them all.
+
 | Key | Action |
 | --- | --- |
-| `hjkl` / arrows | Move; `h`/`l` also switch panes |
-| `Tab` | Runners ↔ served directories |
-| `Enter` | Confirm overlay / show selected path |
-| `q` / `Ctrl-c` | Quit |
-| `?` | Help overlay |
-| `Esc` | Close overlay |
+| `↑↓` / `jk` | Move |
+| `Tab` / `←→` / `hl` | Switch between runners and directories |
 | `s` | Start `amp --no-tui` (pick the process start cwd) |
-| `x` | Stop selected runner (confirms) |
-| `r` | Restart selected runner (confirms; uses that runner's launch spec) |
-| `g` | Refresh runner list |
+| `x` | Stop the selected runner (confirms) |
+| `r` | Restart the selected runner with the settings it was started with (confirms) |
 | `a` | Add a served directory (`amp runner dirs add`) |
 | `d` | Remove the selected served directory (confirms) |
-| `f` | Common flags panel (saved to config) |
+| `Enter` | Show the selected directory's full path |
+| `f` | Default flags for new runners (saved to config) |
 | `u` | Run `amp update` |
+| `U` | Update lazyamp itself |
+| `g` | Refresh now |
+| `L` | Message history |
 | `c` | Show config path |
+| `?` | Help |
+| `q` / `Ctrl-c` | Quit |
 
-Directory picker: `hjkl` browses immediate children of the current folder. `/` or any non-`hjkl` key starts filter mode (typed text is shown; `hjkl` then insert as letters). Filter searches nested directories under the browse root, plus recent dirs and `zoxide query -l` when `zoxide` is on `PATH` (zoxide matches are listed first). Heavy trees (`.git`, `node_modules`, `target`, …) are skipped and results are capped. The walk runs off the UI thread. Arrows always move. `Enter` selects the highlighted match. `Esc` clears the filter first, then closes.
+Mouse: click a runner or directory to select it, click a footer hint or dialog button to press it, scroll to move, click outside a dialog to close it.
+
+Directory picker: typing always searches (nested directories under the browse root, recent dirs, and `zoxide query -l` when `zoxide` is on `PATH`, zoxide first). `↑↓` move; `←→` browse up/into folders while the query is empty; `Tab` opens the highlighted folder; `Enter` picks it (or the typed path); `Esc` clears the query, then closes. Text fields have a real cursor (`←→`, `Home`/`End`, `Ctrl-a`/`Ctrl-e`, `Ctrl-u`). Heavy trees (`.git`, `node_modules`, `target`, …) are skipped and results are capped. The walk runs off the UI thread.
 
 `s` chooses the runner's start cwd. `a` adds a served directory — a path the runner can see, which is not the same as the start cwd.
 
@@ -82,7 +94,11 @@ Removing the **primary directory** (start cwd) with `d` proposes the first remai
 
 This requires a saved launch spec, a known local PID, and another usable served directory. Removing the last directory or automatically changing cwd with `--discover-dirs` is refused before stopping anything. Other directory removals still use `amp runner dirs remove`; directories pinned by `--dir` need a manual launch change.
 
-The right pane shows the last lines of the selected runner's log (under `$XDG_STATE_HOME/lazyamp/logs/`). Amp CLI calls run off the UI thread; the status line shows `working…` while they run.
+The right pane shows the selected runner's status, served directories (★ marks the start cwd), and **Activity**: the tail of the log file that process actually writes to (Linux resolves `/proc/<pid>/fd/1`; otherwise the spawn record). The thread count comes from Amp's latest `(N threads running)` line. A yellow dot and `↻` mean the runner still runs an amp binary that `amp update` has since replaced (Linux: `/proc/<pid>/exe` is ` (deleted)`); it picks up the new version when it restarts.
+
+## Refresh
+
+Refreshing is silent and never blocks actions. A background poller scans local `amp --no-tui` processes and their logs every 2 s (no subprocess) and runs `amp runner list` only every 15 s, when the set of local runner PIDs changes, after an action, or on `g`. Polling pauses while the terminal is unfocused (when the terminal reports focus). Only failures reach the status line, once until they change. Idle for 60 s, this spawns Amp 4 times instead of 19 and uses about a third of the CPU of v0.1.1.
 
 ## Config
 
@@ -113,15 +129,15 @@ Put `recent_dirs` before `[defaults]`. Values written after that table are treat
 
 A **missing** config file uses defaults and may be created on a successful quit. An **invalid** `config.toml` is reported as an error and is never overwritten with defaults.
 
-Config and the spawn/launch registries are written atomically (temp file + rename).
+Config and the spawn/launch registries are written atomically (temp file + rename). State files only gain optional fields, so state written by an older release keeps loading after an update, and a state file that cannot be parsed is never overwritten.
 
-Runner logs, a spawn-PID registry (`spawned.json`), and per-runner launch specs (`launches.json`) live under `$XDG_STATE_HOME/lazyamp/` (usually `~/.local/state/lazyamp/`). Restart replays the saved launch spec (cwd, runner-id, flags), not the current global defaults.
+Runner logs, a spawn-PID registry (`spawned.json`), per-runner launch specs (`launches.json`), and the update-check cache (`update-check.json`) live under `$XDG_STATE_HOME/lazyamp/` (usually `~/.local/state/lazyamp/`). Restart replays how that exact process was started (the spawn record for its PID), then the saved launch spec by runner-id or cwd, never the current global defaults.
 
 ## PID detection
 
 1. Parse a `pid` field from `amp runner list` (JSON keys `pid` / `processId`, or text like `pid 1234`). PIDs that are not a positive `i32` are ignored.
 2. Scan this machine for `amp --no-tui` processes (Linux: `/proc/<pid>/cmdline` + `cwd` + parent PID; other Unix: `ps`). A binary named `amp` matches, and so does `node`/`bun`/`deno` running an Amp script. Processes are grouped by **runner-id and process tree** so wrapper/runtime children are one row, not three.
-3. Amp list identity wins. Local helper PIDs attach to that row. The stop/restart PID is the listed PID when it is in the group, otherwise the tree root. Distinct runner-ids that share a working directory are not merged.
+3. Amp list identity wins. Local helper PIDs attach to that row, but a process without `--runner-id` never attaches to a listed runner whose reported PID is a different process. The stop/restart PID is the listed PID when it is in the group, otherwise the tree root. Distinct runner-ids that share a working directory are not merged.
 4. Runners started from lazyamp are also recorded in `~/.local/state/lazyamp/spawned.json`. Registry entries are kept only if the PID still looks like `amp --no-tui`.
 
 Stop signals **only the exact process PID** — never `kill(-pid)` / process-group broadcast. Before `SIGTERM`/`SIGKILL`, lazyamp verifies identity:
@@ -142,11 +158,10 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-That tag push builds musl Linux and macOS archives, publishes a GitHub Release, and uploads `checksums.txt`.
+That tag push builds musl Linux and macOS archives, publishes a GitHub Release, and uploads `checksums.txt`. `lazyamp update` resolves the latest release through the same `releases/latest` redirect as `install.sh`, then runs the `install.sh` from that tag, so a release needs no extra steps. Keep `scripts/install.sh` backward compatible: older lazyamp binaries pass `--version` and `--prefix` (or `--bin-dir` from v0.2.0).
 
 ## Future
 
-- Auto-updating lazyamp itself
 - Orbs / Amp Net / thread browsing (out of scope)
 
 ## License

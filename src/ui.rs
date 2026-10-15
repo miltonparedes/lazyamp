@@ -1,9 +1,11 @@
-//! Keyboard-first runner manager (ratatui + crossterm).
+//! Runner manager TUI (ratatui + crossterm): keyboard first, mouse works too.
+
+mod view;
 
 use crate::amp::{
-    find_launch_spec, is_plausible_runner_id, launch_spec_for_restart, removal_restart_spec,
-    restart_start_options, runner_log_path, stop_verified, tail_log_lines, AmpClient, LaunchSpec,
-    Runner, StartHealth, StartOptions, StopOutcome,
+    is_plausible_runner_id, launch_spec_for_restart, local_amp_pids, merge_with_local,
+    removal_restart_spec, restart_start_options, saved_launch_spec, stop_verified, tail_log_lines,
+    AmpClient, LaunchSpec, Runner, StartHealth, StartOptions, StopOutcome,
 };
 use crate::config::{
     config_path, cycle_choice, Config, StartDefaults, LOG_LEVELS, MODES, VISIBILITIES,
@@ -12,59 +14,37 @@ use crate::dirpick::{
     collect_ranked_paths, query_zoxide_dirs, walk_matching_dirs, PathSource, RankedPath,
     RankedSearch,
 };
+use crate::update;
 use anyhow::Result;
 use chrono::Local;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::{Duration, Instant, SystemTime};
 
-const REFRESH_EVERY: Duration = Duration::from_secs(3);
 const LOG_CAP: usize = 200;
 const PICKER_DEBOUNCE: Duration = Duration::from_millis(120);
-const HELP_TEXT: &str = "\
-lazyamp — manage Amp --no-tui runners
-
-Navigation
-  hjkl / arrows     move; h/l also switch panes
-  Tab               next pane (runners ↔ served dirs)
-  Enter             confirm (picker / flags / typed path)
-  Esc               close overlay
-  q / Ctrl-c        quit
-  ?                 this help
-
-Runners
-  s                 start amp --no-tui (pick the process start cwd)
-  x                 stop the selected runner (confirms)
-  r                 restart selected runner (confirms)
-  g                 refresh `amp runner list`
-
-Served directories (paths the runner can see; not the start cwd)
-  a                 add a served directory (`amp runner dirs add`)
-  d                 remove the selected served directory
-
-Other
-  f                 common flags / defaults (saved to config)
-  u                 run `amp update`
-  c                 show config path
-
-Directory picker: hjkl browse immediate children. / or typing filters
-recursively under the browse root, plus recent dirs and `zoxide query -l`
-when zoxide is installed.
-
-This UI does not open Amp's interactive agent TUI.";
+/// Local `/proc` scan + log reads: cheap, catches starts and stops quickly.
+const LOCAL_POLL: Duration = Duration::from_secs(2);
+/// `amp runner list` spawns Amp (~150 ms, ~200 MB peak RSS): run it rarely.
+const AMP_LIST_EVERY: Duration = Duration::from_secs(15);
+const UPDATE_CHECK_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const TOAST_FOR: Duration = Duration::from_secs(5);
+const ERROR_TOAST_FOR: Duration = Duration::from_secs(12);
+const ACTIVITY_LINES: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -76,26 +56,36 @@ enum Pane {
 enum Overlay {
     None,
     Help,
+    Log,
     Flags,
     Picker,
     EditField,
     Confirm,
 }
 
+/// A confirmed action carries its target, so a refresh that changes the
+/// selection while the dialog is open cannot redirect it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfirmAction {
-    Stop,
-    Restart,
+    Stop(Runner),
+    Restart(Runner),
     RemoveDir {
         runner: Runner,
         path: PathBuf,
         restart: Option<Box<LaunchSpec>>,
     },
+    SelfUpdate,
+    /// lazyamp was replaced on disk; quit so the user starts the new version.
+    /// (No in-place `exec`: it would drop the threads that reap runners this
+    /// process started, leaving zombies that break a later stop/restart.)
+    QuitAfterUpdate(String),
 }
 
 enum AmpJob {
-    Refresh,
     Update,
+    SelfUpdate {
+        exe: PathBuf,
+    },
     Start {
         cwd: PathBuf,
         opts: StartOptions,
@@ -124,11 +114,14 @@ enum AmpJob {
 }
 
 enum AmpEvent {
-    RefreshOk(Vec<Runner>),
     UpdateOk {
         out: String,
         version: Option<String>,
     },
+    SelfUpToDate {
+        latest: String,
+    },
+    SelfUpdated(update::InstallOutcome),
     Started {
         id: String,
         outcome: crate::amp::StartOutcome,
@@ -155,6 +148,24 @@ enum AmpEvent {
     Failed(String),
 }
 
+/// Requests to the background runner poller.
+enum PollCmd {
+    /// Refresh now, including `amp runner list`.
+    Now,
+    /// Terminal focus changed; polling pauses while unfocused.
+    Focus(bool),
+}
+
+/// Results from the background runner poller. Never touches the status line
+/// unless something failed.
+enum PollEvent {
+    Snapshot {
+        runners: Vec<Runner>,
+        list_error: Option<String>,
+    },
+    AmpVersion(String),
+}
+
 enum PickerJob {
     Search {
         gen: u64,
@@ -168,10 +179,12 @@ enum PickerEvent {
     Results { gen: u64, entries: Vec<PickerEntry> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PickerPurpose {
     Start,
-    AddDir,
+    /// Captured when the picker opens, so a refresh that changes the selection
+    /// cannot redirect the directory to another runner.
+    AddDir(Runner),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +237,20 @@ impl FlagField {
         )
     }
 
+    fn name(self) -> &'static str {
+        match self {
+            FlagField::RunnerId => "Runner ID",
+            FlagField::Mode => "Mode",
+            FlagField::LogLevel => "Log level",
+            FlagField::Visibility => "Thread visibility",
+            FlagField::SettingsFile => "Settings file",
+            FlagField::McpConfig => "MCP config",
+            FlagField::RemoteControl => "Remote control terminal",
+            FlagField::DiscoverDirs => "Discover directories",
+            FlagField::AmpEnv => "Use Amp env",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             FlagField::RunnerId => "--runner-id",
@@ -241,14 +268,16 @@ impl FlagField {
 
 #[derive(Debug, Clone)]
 struct PickerEntry {
-    label: String,
+    /// Where the match came from (`recent`, `zoxide`, …).
+    tag: &'static str,
+    text: String,
     path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 struct DirPicker {
     purpose: PickerPurpose,
-    input: String,
+    input: TextInput,
     filter_mode: bool,
     browse_root: PathBuf,
     cursor: usize,
@@ -256,6 +285,121 @@ struct DirPicker {
     search_gen: u64,
     searching: bool,
     debounce_until: Option<Instant>,
+}
+
+/// Single-line text field with a real cursor (byte index on a char boundary).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TextInput {
+    text: String,
+    cursor: usize,
+}
+
+impl TextInput {
+    fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.len();
+        Self { text, cursor }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    fn prev_boundary(&self) -> usize {
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i)
+    }
+
+    fn next_boundary(&self) -> usize {
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
+    }
+
+    /// Apply an editing key. Returns true when the text changed.
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.text.len(),
+            KeyCode::Char('u') if ctrl => {
+                self.text.replace_range(..self.cursor, "");
+                self.cursor = 0;
+                return true;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.text.insert(self.cursor, c);
+                self.cursor += c.len_utf8();
+                return true;
+            }
+            KeyCode::Backspace if self.cursor > 0 => {
+                let prev = self.prev_boundary();
+                self.text.replace_range(prev..self.cursor, "");
+                self.cursor = prev;
+                return true;
+            }
+            KeyCode::Delete if self.cursor < self.text.len() => {
+                let next = self.next_boundary();
+                self.text.replace_range(self.cursor..next, "");
+                return true;
+            }
+            KeyCode::Left => self.cursor = self.prev_boundary(),
+            KeyCode::Right => self.cursor = self.next_boundary(),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.text.len(),
+            _ => {}
+        }
+        false
+    }
+}
+
+/// Clickable areas recorded by the last draw, used to route mouse events.
+#[derive(Debug, Default)]
+struct HitMap {
+    runners: ListHit,
+    dirs: ListHit,
+    picker: ListHit,
+    flags: ListHit,
+    /// The open dialog; clicks outside it close it.
+    popup: Option<Rect>,
+    /// Footer hints and dialog buttons, each mapped to the key it stands for.
+    buttons: Vec<(Rect, KeyCode)>,
+}
+
+/// A rendered list: its inner area (one row per item) and scroll offset.
+#[derive(Debug, Default, Clone, Copy)]
+struct ListHit {
+    area: Rect,
+    offset: usize,
+    len: usize,
+}
+
+impl ListHit {
+    fn index_at(&self, col: u16, row: u16) -> Option<usize> {
+        if !self.area.contains(Position::new(col, row)) {
+            return None;
+        }
+        let idx = self.offset + usize::from(row - self.area.y);
+        (idx < self.len).then_some(idx)
+    }
+}
+
+/// Cached tail of the selected runner's log; re-read only when the file changes.
+#[derive(Debug, Default)]
+struct LogTail {
+    path: Option<PathBuf>,
+    stamp: Option<(u64, SystemTime)>,
+    lines: Vec<String>,
+}
+
+struct Toast {
+    text: String,
+    kind: LogKind,
+    until: Instant,
 }
 
 struct App {
@@ -271,17 +415,33 @@ struct App {
     picker: Option<DirPicker>,
     flags: StartDefaults,
     flag_field: FlagField,
-    edit_buffer: String,
+    edit: TextInput,
     log: VecDeque<LogLine>,
-    status: String,
-    status_kind: LogKind,
+    toast: Option<Toast>,
     amp_version: String,
-    last_refresh: Instant,
     should_quit: bool,
-    busy: bool,
+    /// Label of the user action running on the Amp worker, if any.
+    busy: Option<String>,
+    /// A manual refresh (`g`) is in flight.
+    refreshing: bool,
+    /// Last `amp runner list` failure, shown once until it changes or clears.
+    list_error: Option<String>,
     help_scroll: u16,
+    log_scroll: usize,
+    runner_log: LogTail,
+    /// Newer lazyamp release tag, when one exists.
+    latest_release: Option<String>,
+    /// This executable, resolved at startup (before an update can replace it).
+    exe: Option<PathBuf>,
+    /// Printed after the terminal is restored (e.g. "run lazyamp again").
+    exit_note: Option<String>,
+    started: Instant,
+    hits: RefCell<HitMap>,
     job_tx: Sender<AmpJob>,
     ev_rx: Receiver<AmpEvent>,
+    poll_tx: Sender<PollCmd>,
+    poll_rx: Receiver<PollEvent>,
+    update_rx: Receiver<String>,
     picker_tx: Sender<PickerJob>,
     picker_rx: Receiver<PickerEvent>,
 }
@@ -292,7 +452,7 @@ struct LogLine {
     kind: LogKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogKind {
     Info,
     Ok,
@@ -320,14 +480,18 @@ pub fn run() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        restore_terminal();
         hook(info);
     }));
 
@@ -337,10 +501,23 @@ pub fn run() -> Result<()> {
     }
     let result = app_loop(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    restore_terminal();
     terminal.show_cursor()?;
-    result
+    result?;
+    if let Some(note) = &app.exit_note {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableFocusChange,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
 }
 
 fn spawn_picker_worker() -> (Sender<PickerJob>, Receiver<PickerEvent>) {
@@ -399,10 +576,6 @@ fn worker_loop(client: AmpClient, jobs: Receiver<AmpJob>, events: Sender<AmpEven
 
 fn run_job(client: &AmpClient, job: AmpJob) -> AmpEvent {
     match job {
-        AmpJob::Refresh => match client.list_runners() {
-            Ok(runners) => AmpEvent::RefreshOk(runners),
-            Err(err) => AmpEvent::Failed(format!("refresh failed: {err:#}")),
-        },
         AmpJob::Update => match client.update() {
             Ok(out) => {
                 let version = client.version().ok();
@@ -410,6 +583,19 @@ fn run_job(client: &AmpClient, job: AmpJob) -> AmpEvent {
             }
             Err(err) => AmpEvent::Failed(format!("amp update failed: {err:#}")),
         },
+        AmpJob::SelfUpdate { exe } => {
+            let latest = match update::check_latest_cached(Duration::ZERO) {
+                Ok(tag) => tag,
+                Err(err) => return AmpEvent::Failed(format!("update check failed: {err:#}")),
+            };
+            if !update::is_newer(update::current_version(), &latest) {
+                return AmpEvent::SelfUpToDate { latest };
+            }
+            match update::install(&exe, Some(&latest)) {
+                Ok(outcome) => AmpEvent::SelfUpdated(outcome),
+                Err(err) => AmpEvent::Failed(format!("lazyamp update failed: {err:#}")),
+            }
+        }
         AmpJob::Start { cwd, opts } => {
             let id = opts
                 .runner_id
@@ -482,25 +668,117 @@ fn run_job(client: &AmpClient, job: AmpJob) -> AmpEvent {
     }
 }
 
+fn spawn_poller(client: AmpClient) -> (Sender<PollCmd>, Receiver<PollEvent>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (ev_tx, ev_rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("lazyamp-poll".into())
+        .spawn(move || poller_loop(client, cmd_rx, ev_tx))
+        .expect("failed to start runner poller thread");
+    (cmd_tx, ev_rx)
+}
+
+/// Two-tier polling: every [`LOCAL_POLL`] scan local processes and logs (no
+/// subprocess); run `amp runner list` only every [`AMP_LIST_EVERY`], when the
+/// set of local runner PIDs changes, or on request. Only changed snapshots are sent.
+fn poller_loop(client: AmpClient, cmds: Receiver<PollCmd>, events: Sender<PollEvent>) {
+    if let Ok(version) = client.version() {
+        if events.send(PollEvent::AmpVersion(version)).is_err() {
+            return;
+        }
+    }
+    let mut listed: Vec<Runner> = Vec::new();
+    let mut list_error: Option<String> = None;
+    let mut last_list: Option<Instant> = None;
+    let mut last_pids: Option<Vec<u32>> = None;
+    let mut last_sent: Option<(Vec<Runner>, Option<String>)> = None;
+    let mut focused = true;
+    let mut force = true;
+    loop {
+        if focused || force {
+            let pids = local_amp_pids();
+            let stale = last_list.is_none_or(|t| t.elapsed() >= AMP_LIST_EVERY);
+            if force || stale || last_pids.as_ref() != Some(&pids) {
+                match client.list_from_amp() {
+                    Ok(runners) => {
+                        listed = runners;
+                        list_error = None;
+                    }
+                    Err(err) => {
+                        listed.clear();
+                        list_error = Some(format!("{err:#}"));
+                    }
+                }
+                last_list = Some(Instant::now());
+            }
+            last_pids = Some(pids);
+            let snapshot = (merge_with_local(listed.clone()), list_error.clone());
+            // A forced refresh always answers, so a manual refresh can finish.
+            if force || last_sent.as_ref() != Some(&snapshot) {
+                let (runners, list_error) = snapshot.clone();
+                if events
+                    .send(PollEvent::Snapshot {
+                        runners,
+                        list_error,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                last_sent = Some(snapshot);
+            }
+            force = false;
+        }
+        match cmds.recv_timeout(LOCAL_POLL) {
+            Ok(cmd) => {
+                for cmd in std::iter::once(cmd).chain(cmds.try_iter()) {
+                    match cmd {
+                        PollCmd::Now => force = true,
+                        // Regaining focus wakes the loop; the usual staleness
+                        // and PID-change rules decide whether to call Amp.
+                        PollCmd::Focus(now_focused) => focused = now_focused,
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Resolve the latest lazyamp release off the UI thread (cached for a day).
+fn spawn_update_check() -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    if std::env::var_os("LAZYAMP_NO_UPDATE_CHECK").is_none() {
+        let _ = std::thread::Builder::new()
+            .name("lazyamp-update-check".into())
+            .spawn(move || {
+                if let Ok(tag) = update::check_latest_cached(UPDATE_CHECK_MAX_AGE) {
+                    let _ = tx.send(tag);
+                }
+            });
+    }
+    rx
+}
+
 fn app_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         app.drain_events();
         app.drain_picker_events();
         app.maybe_dispatch_picker_search();
-        terminal.draw(|f| draw(f, app))?;
+        app.refresh_runner_log();
+        terminal.draw(|f| view::draw(f, app))?;
         if app.should_quit {
             break;
         }
         if event::poll(app.poll_timeout())? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key);
-                }
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                Event::FocusGained => app.poll(PollCmd::Focus(true)),
+                Event::FocusLost => app.poll(PollCmd::Focus(false)),
+                _ => {}
             }
-        }
-        if app.overlay == Overlay::None && !app.busy && app.last_refresh.elapsed() >= REFRESH_EVERY
-        {
-            app.request_refresh();
         }
     }
     if app.config_writable {
@@ -512,8 +790,8 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 impl App {
     fn new(client: AmpClient, config: Config, config_path: PathBuf, config_writable: bool) -> Self {
         let flags = config.defaults.clone();
-        let amp_version = client.version().unwrap_or_else(|_| "unknown".into());
-        let binary = client.binary.display().to_string();
+        let binary = client.binary.clone();
+        let (poll_tx, poll_rx) = spawn_poller(client.clone());
         let (job_tx, ev_rx) = spawn_amp_worker(client);
         let (picker_tx, picker_rx) = spawn_picker_worker();
         let mut app = Self {
@@ -529,24 +807,31 @@ impl App {
             picker: None,
             flags,
             flag_field: FlagField::RunnerId,
-            edit_buffer: String::new(),
+            edit: TextInput::default(),
             log: VecDeque::new(),
-            status: "ready".into(),
-            status_kind: LogKind::Info,
-            amp_version,
-            last_refresh: Instant::now() - REFRESH_EVERY,
+            toast: None,
+            amp_version: String::new(),
             should_quit: false,
-            busy: false,
+            busy: None,
+            refreshing: true,
+            list_error: None,
             help_scroll: 0,
+            log_scroll: 0,
+            runner_log: LogTail::default(),
+            latest_release: None,
+            exe: update::current_exe().ok(),
+            exit_note: None,
+            started: Instant::now(),
+            hits: RefCell::new(HitMap::default()),
             job_tx,
             ev_rx,
+            poll_tx,
+            poll_rx,
+            update_rx: spawn_update_check(),
             picker_tx,
             picker_rx,
         };
-        app.log(
-            LogKind::Info,
-            format!("Amp {} — {binary}", amp_version_label(&app.amp_version)),
-        );
+        app.history(LogKind::Info, format!("amp binary {}", binary.display()));
         if !app.config_writable {
             app.log(
                 LogKind::Error,
@@ -556,30 +841,30 @@ impl App {
                 ),
             );
         }
-        app.request_refresh();
         app
     }
 
     fn submit(&mut self, job: AmpJob, working: impl Into<String>) {
-        if self.busy {
-            self.log(LogKind::Info, "already working…");
+        if let Some(current) = &self.busy {
+            let text = format!("still busy: {current}");
+            self.log(LogKind::Info, text);
             return;
         }
-        let working = working.into();
-        self.busy = true;
-        self.status = working.clone();
-        self.status_kind = LogKind::Info;
+        self.busy = Some(working.into());
         if self.job_tx.send(job).is_err() {
-            self.busy = false;
+            self.busy = None;
             self.log(LogKind::Error, "Amp worker thread is gone");
         }
     }
 
+    fn poll(&mut self, cmd: PollCmd) {
+        let _ = self.poll_tx.send(cmd);
+    }
+
+    /// Manual refresh (`g`): the header shows a spinner until the snapshot arrives.
     fn request_refresh(&mut self) {
-        if self.busy {
-            return;
-        }
-        self.submit(AmpJob::Refresh, "working… refresh");
+        self.refreshing = true;
+        self.poll(PollCmd::Now);
     }
 
     fn maybe_save_config(&mut self) {
@@ -597,12 +882,73 @@ impl App {
                 Ok(event) => self.handle_event(event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.busy = false;
-                    self.log(LogKind::Error, "Amp worker thread disconnected");
+                    if self.busy.take().is_some() {
+                        self.log(LogKind::Error, "Amp worker thread disconnected");
+                    }
                     break;
                 }
             }
         }
+        while let Ok(event) = self.poll_rx.try_recv() {
+            self.handle_poll(event);
+        }
+        while let Ok(tag) = self.update_rx.try_recv() {
+            if update::is_newer(update::current_version(), &tag) {
+                self.latest_release = Some(tag);
+            }
+        }
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|t| Instant::now() >= t.until)
+        {
+            self.toast = None;
+        }
+    }
+
+    fn handle_poll(&mut self, event: PollEvent) {
+        match event {
+            PollEvent::AmpVersion(version) => self.amp_version = version,
+            PollEvent::Snapshot {
+                runners,
+                list_error,
+            } => {
+                self.refreshing = false;
+                let current_id = self.current_runner().map(|r| r.id.clone());
+                let current_dir = self.selected_dir_path();
+                self.runners = runners;
+                self.reselect(current_id.as_deref(), current_dir.as_deref());
+                if list_error != self.list_error {
+                    if let Some(err) = &list_error {
+                        let text = if self.runners.is_empty() {
+                            format!("amp runner list failed: {err}")
+                        } else {
+                            format!("amp runner list failed; showing local processes: {err}")
+                        };
+                        self.log(LogKind::Error, text);
+                    }
+                    self.list_error = list_error;
+                }
+            }
+        }
+    }
+
+    /// Re-read the selected runner's log only when its size or mtime changed.
+    fn refresh_runner_log(&mut self) {
+        let path = self.current_runner().and_then(|r| r.log_path.clone());
+        let stamp = path.as_deref().and_then(|p| {
+            let meta = std::fs::metadata(p).ok()?;
+            Some((meta.len(), meta.modified().ok()?))
+        });
+        if path == self.runner_log.path && stamp == self.runner_log.stamp {
+            return;
+        }
+        self.runner_log.lines = path
+            .as_deref()
+            .map(|p| tail_log_lines(p, ACTIVITY_LINES))
+            .unwrap_or_default();
+        self.runner_log.path = path;
+        self.runner_log.stamp = stamp;
     }
 
     fn poll_timeout(&self) -> Duration {
@@ -615,7 +961,11 @@ impl App {
                 return remaining.min(Duration::from_millis(200));
             }
         }
-        Duration::from_millis(200)
+        if self.busy.is_some() || self.refreshing {
+            // Keep the spinner moving.
+            return Duration::from_millis(100);
+        }
+        Duration::from_millis(250)
     }
 
     fn drain_picker_events(&mut self) {
@@ -658,7 +1008,7 @@ impl App {
             return;
         }
         picker.debounce_until = None;
-        let query = picker.input.trim().to_string();
+        let query = picker.input.text.trim().to_string();
         if query.is_empty() {
             picker.searching = false;
             return;
@@ -675,25 +1025,42 @@ impl App {
     }
 
     fn handle_event(&mut self, event: AmpEvent) {
-        self.busy = false;
+        self.busy = None;
         match event {
-            AmpEvent::RefreshOk(list) => {
-                let current_id = self.current_runner().map(|r| r.id.clone());
-                let current_dir = self.selected_dir_path();
-                self.runners = list;
-                self.reselect(current_id.as_deref(), current_dir.as_deref());
-                if self.status_kind != LogKind::Error {
-                    self.status = format!("{} runner(s)", self.runners.len());
-                    self.status_kind = LogKind::Info;
-                }
-                self.last_refresh = Instant::now();
-            }
             AmpEvent::UpdateOk { out, version } => {
                 let summary = summarize_output(&out);
-                self.log(LogKind::Ok, format!("amp update: {summary}"));
                 if let Some(v) = version {
                     self.amp_version = v;
                 }
+                self.log(
+                    LogKind::Ok,
+                    format!("amp update: {summary}. Running runners keep the old version until restarted (↻)."),
+                );
+                self.request_refresh();
+            }
+            AmpEvent::SelfUpToDate { latest } => {
+                self.latest_release = None;
+                self.log(
+                    LogKind::Ok,
+                    format!(
+                        "lazyamp {} is up to date (latest {latest})",
+                        update::current_version()
+                    ),
+                );
+            }
+            AmpEvent::SelfUpdated(outcome) => {
+                self.latest_release = None;
+                self.history(LogKind::Info, summarize_output(&outcome.output));
+                self.log(
+                    LogKind::Ok,
+                    format!(
+                        "installed lazyamp {} at {}",
+                        outcome.tag,
+                        display_path(&outcome.path)
+                    ),
+                );
+                self.confirm = Some(ConfirmAction::QuitAfterUpdate(outcome.tag));
+                self.overlay = Overlay::Confirm;
             }
             AmpEvent::Started { id, outcome } => {
                 self.config.remember_dir(&outcome.cwd);
@@ -704,12 +1071,12 @@ impl App {
             AmpEvent::Stopped { id, outcome, pid } => {
                 match outcome {
                     StopOutcome::Stopped => {
-                        self.log(LogKind::Ok, format!("stopped {id} (pid {pid})"));
+                        self.log(LogKind::Ok, format!("stopped {id}"));
                     }
                     StopOutcome::AlreadyGone => {
                         self.log(
                             LogKind::Info,
-                            format!("pid {pid} for {id} was already gone"),
+                            format!("{id} (pid {pid}) had already exited"),
                         );
                     }
                 }
@@ -722,28 +1089,18 @@ impl App {
             AmpEvent::DirsAddOk { id, path, out } => {
                 self.config.remember_dir(&path);
                 self.maybe_save_config();
+                self.history(LogKind::Info, summarize_output(&out));
                 self.log(
                     LogKind::Ok,
-                    format!(
-                        "added {} to {id} {}",
-                        display_path(&path),
-                        first_line_or_empty(&out)
-                    )
-                    .trim()
-                    .to_string(),
+                    format!("{id} now serves {}", display_path(&path)),
                 );
                 self.request_refresh();
             }
             AmpEvent::DirsRemoveOk { id, path, out } => {
+                self.history(LogKind::Info, summarize_output(&out));
                 self.log(
                     LogKind::Ok,
-                    format!(
-                        "removed {} from {id} {}",
-                        display_path(&path),
-                        first_line_or_empty(&out)
-                    )
-                    .trim()
-                    .to_string(),
+                    format!("{id} no longer serves {}", display_path(&path)),
                 );
                 self.request_refresh();
             }
@@ -752,39 +1109,31 @@ impl App {
     }
 
     fn log_start_outcome(&mut self, verb: &str, id: &str, outcome: &crate::amp::StartOutcome) {
-        let log = display_path(&outcome.log_path);
-        match &outcome.health {
-            StartHealth::Listed => self.log(
-                LogKind::Ok,
-                format!("{verb} {id} (pid {}, listed)  log {log}", outcome.pid),
+        self.history(
+            LogKind::Info,
+            format!(
+                "{verb} {id}: pid {}, log {}",
+                outcome.pid,
+                display_path(&outcome.log_path)
             ),
+        );
+        match &outcome.health {
+            StartHealth::Listed => self.log(LogKind::Ok, format!("{verb} {id}")),
             StartHealth::Alive => self.log(
                 LogKind::Info,
-                format!(
-                    "spawned {id} (pid {}) — not yet in `amp runner list`; log {log}",
-                    outcome.pid
-                ),
+                format!("{verb} {id}; waiting for it to register with Amp"),
             ),
             StartHealth::NeedsLogin => self.log(
                 LogKind::Error,
-                format!(
-                    "Amp at pid {} is waiting for login. Run `amp login` in a terminal. log {log}",
-                    outcome.pid
-                ),
+                format!("{id} is waiting for login: run `amp login` in a terminal"),
             ),
             StartHealth::Exited { hint } => {
-                let hint = hint.trim();
-                let extra = if hint.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {hint}")
-                };
+                for line in hint.lines().filter(|l| !l.trim().is_empty()) {
+                    self.history(LogKind::Error, line.to_string());
+                }
                 self.log(
                     LogKind::Error,
-                    format!(
-                        "{id} exited immediately (pid {}). See {log}{extra}",
-                        outcome.pid
-                    ),
+                    format!("{id} exited right after starting (L shows its log)"),
                 );
             }
         }
@@ -808,6 +1157,14 @@ impl App {
                 }
                 _ => {}
             },
+            Overlay::Log => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => {
+                    self.overlay = Overlay::None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_log(-1),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_log(1),
+                _ => {}
+            },
             Overlay::Flags => self.handle_flags_key(key),
             Overlay::Picker => self.handle_picker_key(key),
             Overlay::EditField => self.handle_edit_key(key),
@@ -816,40 +1173,181 @@ impl App {
         }
     }
 
+    /// Log history scrolls from the bottom: `log_scroll` lines above the newest.
+    fn scroll_log(&mut self, delta: i32) {
+        let max = self.log.len().saturating_sub(1) as i32;
+        self.log_scroll = (self.log_scroll as i32 + delta).clamp(0, max) as usize;
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let (col, row) = (mouse.column, mouse.row);
+        let scroll = match mouse.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::Down(MouseButton::Left) => 0,
+            _ => return,
+        };
+        if scroll != 0 {
+            self.handle_scroll(col, row, scroll);
+            return;
+        }
+        let hits = self.hits.borrow();
+        let button = hits
+            .buttons
+            .iter()
+            .find(|(area, _)| area.contains(Position::new(col, row)))
+            .map(|(_, code)| *code);
+        let outside_popup = hits
+            .popup
+            .is_some_and(|p| !p.contains(Position::new(col, row)));
+        let (runner_hit, dir_hit) = (
+            hits.runners.index_at(col, row),
+            hits.dirs.index_at(col, row),
+        );
+        let (picker_hit, flag_hit) = (
+            hits.picker.index_at(col, row),
+            hits.flags.index_at(col, row),
+        );
+        drop(hits);
+
+        if let Some(code) = button {
+            self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            return;
+        }
+        match self.overlay {
+            Overlay::None => {
+                if let Some(idx) = runner_hit {
+                    if self.selected_runner != idx {
+                        self.selected_dir = 0;
+                    }
+                    self.pane = Pane::Runners;
+                    self.selected_runner = idx;
+                } else if let Some(idx) = dir_hit {
+                    self.pane = Pane::Dirs;
+                    self.selected_dir = idx;
+                }
+            }
+            Overlay::Picker => {
+                if let (Some(idx), Some(picker)) = (picker_hit, self.picker.as_mut()) {
+                    if picker.cursor == idx {
+                        // Second click on the highlighted entry picks it.
+                        self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    } else {
+                        picker.cursor = idx;
+                    }
+                } else if outside_popup {
+                    self.picker = None;
+                    self.overlay = Overlay::None;
+                }
+            }
+            Overlay::Flags => {
+                if let Some(idx) = flag_hit {
+                    let field = FlagField::ALL[idx];
+                    if self.flag_field == field {
+                        self.activate_flag_field();
+                    } else {
+                        self.flag_field = field;
+                    }
+                } else if outside_popup {
+                    self.overlay = Overlay::None;
+                }
+            }
+            Overlay::Confirm if outside_popup => {
+                self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            Overlay::Help | Overlay::Log if outside_popup => self.overlay = Overlay::None,
+            Overlay::EditField if outside_popup => self.overlay = Overlay::Flags,
+            _ => {}
+        }
+    }
+
+    fn handle_scroll(&mut self, col: u16, row: u16, delta: i32) {
+        match self.overlay {
+            Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(delta as i16);
+            }
+            Overlay::Log => self.scroll_log(-delta),
+            Overlay::Picker => {
+                if let Some(picker) = self.picker.as_mut() {
+                    let max = picker.entries.len().saturating_sub(1) as i32;
+                    picker.cursor = (picker.cursor as i32 + delta).clamp(0, max) as usize;
+                }
+            }
+            Overlay::Flags => {
+                self.flag_field = if delta > 0 {
+                    self.flag_field.next()
+                } else {
+                    self.flag_field.prev()
+                };
+            }
+            Overlay::None => {
+                let hits = self.hits.borrow();
+                let pane = if hits.dirs.area.contains(Position::new(col, row)) {
+                    Pane::Dirs
+                } else if hits.runners.area.contains(Position::new(col, row)) {
+                    Pane::Runners
+                } else {
+                    return;
+                };
+                drop(hits);
+                self.pane = pane;
+                self.move_sel(delta);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_normal_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.overlay = Overlay::Help,
-            KeyCode::Tab => self.cycle_pane(),
-            KeyCode::BackTab => self.cycle_pane(),
+            KeyCode::Char('?') => {
+                self.help_scroll = 0;
+                self.overlay = Overlay::Help;
+            }
+            KeyCode::Char('L') => {
+                self.log_scroll = 0;
+                self.overlay = Overlay::Log;
+            }
+            KeyCode::Tab | KeyCode::BackTab => self.cycle_pane(),
             KeyCode::Char('h') | KeyCode::Left => self.pane = Pane::Runners,
             KeyCode::Char('l') | KeyCode::Right => self.pane = Pane::Dirs,
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::Char('g') => self.request_refresh(),
             KeyCode::Char('s') => self.open_picker(PickerPurpose::Start),
-            KeyCode::Char('x') => self.ask_confirm(ConfirmAction::Stop),
-            KeyCode::Char('r') => self.ask_confirm(ConfirmAction::Restart),
-            KeyCode::Char('a') => self.open_picker(PickerPurpose::AddDir),
-            KeyCode::Char('d') => self.ask_remove_dir(),
-            KeyCode::Char('u') => {
-                self.submit(AmpJob::Update, "working… amp update");
+            KeyCode::Char('x') => {
+                if let Some(runner) = self.current_runner().cloned() {
+                    self.ask_confirm(ConfirmAction::Stop(runner));
+                } else {
+                    self.log(LogKind::Error, "no runner selected");
+                }
             }
+            KeyCode::Char('r') => {
+                if let Some(runner) = self.current_runner().cloned() {
+                    self.ask_confirm(ConfirmAction::Restart(runner));
+                } else {
+                    self.log(LogKind::Error, "no runner selected");
+                }
+            }
+            KeyCode::Char('a') => match self.current_runner().cloned() {
+                Some(runner) => self.open_picker(PickerPurpose::AddDir(runner)),
+                None => self.log(LogKind::Error, "select a runner before adding a directory"),
+            },
+            KeyCode::Char('d') => self.ask_remove_dir(),
+            KeyCode::Char('u') => self.submit(AmpJob::Update, "updating amp"),
+            KeyCode::Char('U') => self.ask_confirm(ConfirmAction::SelfUpdate),
             KeyCode::Char('f') => {
                 self.flags = self.config.defaults.clone();
                 self.flag_field = FlagField::RunnerId;
                 self.overlay = Overlay::Flags;
             }
             KeyCode::Char('c') => {
-                self.log(
-                    LogKind::Info,
-                    format!("config {}", self.config_path.display()),
-                );
-                self.status = self.config_path.display().to_string();
+                let text = format!("config: {}", self.config_path.display());
+                self.log(LogKind::Info, text);
             }
             KeyCode::Enter if self.pane == Pane::Dirs => {
                 if let Some(dir) = self.selected_dir_path() {
-                    self.status = dir.display().to_string();
+                    self.log(LogKind::Info, dir.display().to_string());
                 }
             }
             _ => {}
@@ -858,147 +1356,86 @@ impl App {
 
     fn handle_flags_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.overlay = Overlay::None,
-            KeyCode::Char('q') => self.overlay = Overlay::None,
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
             KeyCode::Char('j') | KeyCode::Down => self.flag_field = self.flag_field.next(),
             KeyCode::Char('k') | KeyCode::Up => self.flag_field = self.flag_field.prev(),
             KeyCode::Char('s') => self.save_flags(),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_flag_field(),
-            KeyCode::Char('l') | KeyCode::Right => self.nudge_flag(true),
-            KeyCode::Char('h') | KeyCode::Left => self.nudge_flag(true),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('h') | KeyCode::Left => {
+                self.nudge_flag()
+            }
             _ => {}
         }
     }
 
+    /// Like fzf: typing always edits the query; ↑↓ move; ←→ browse while the
+    /// query is empty; Tab enters the highlighted directory.
     fn handle_picker_key(&mut self, key: KeyEvent) {
         let Some(picker) = self.picker.as_mut() else {
             self.overlay = Overlay::None;
             return;
         };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let empty = picker.input.text.is_empty();
         match key.code {
             KeyCode::Esc => {
-                if picker.filter_mode || !picker.input.is_empty() {
+                if empty {
+                    self.picker = None;
+                    self.overlay = Overlay::None;
+                } else {
                     picker.input.clear();
                     picker.filter_mode = false;
                     picker.cursor = 0;
                     refresh_picker(picker, &self.config);
-                } else {
-                    self.picker = None;
-                    self.overlay = Overlay::None;
                 }
             }
             KeyCode::Enter => {
-                let path = picker_selected_path(picker).or_else(|| {
-                    if picker.input.trim().is_empty() {
-                        None
-                    } else {
-                        Some(expand_path(picker.input.trim()))
-                    }
-                });
+                let typed = picker.input.text.trim();
+                let path = picker_selected_path(picker)
+                    .or_else(|| (!typed.is_empty()).then(|| expand_path(typed)));
                 if let Some(path) = path {
-                    let purpose = picker.purpose;
+                    let purpose = picker.purpose.clone();
                     self.picker = None;
                     self.overlay = Overlay::None;
                     self.finish_picker(purpose, path);
                 }
             }
-            KeyCode::Right => {
-                if let Some(entry) = picker.entries.get(picker.cursor).cloned() {
-                    if entry.path.is_dir() {
-                        picker.browse_root = entry.path;
-                        picker.cursor = 0;
-                        refresh_picker(picker, &self.config);
-                    }
-                }
-            }
-            KeyCode::Left => {
-                if let Some(parent) = picker.browse_root.parent() {
-                    picker.browse_root = parent.to_path_buf();
+            KeyCode::Down => picker_move(picker, 1),
+            KeyCode::Up => picker_move(picker, -1),
+            KeyCode::Char('j' | 'n') if ctrl => picker_move(picker, 1),
+            KeyCode::Char('k' | 'p') if ctrl => picker_move(picker, -1),
+            KeyCode::Right if empty => picker_browse_into(picker, &self.config),
+            KeyCode::Left if empty => picker_browse_up(picker, &self.config),
+            KeyCode::Tab => picker_browse_into(picker, &self.config),
+            _ => {
+                if picker.input.handle_key(key) {
+                    picker.filter_mode = !picker.input.text.is_empty();
                     picker.cursor = 0;
                     refresh_picker(picker, &self.config);
                 }
             }
-            KeyCode::Char('l') if key.modifiers.is_empty() && !picker.filter_mode => {
-                if let Some(entry) = picker.entries.get(picker.cursor).cloned() {
-                    if entry.path.is_dir() {
-                        picker.browse_root = entry.path;
-                        picker.cursor = 0;
-                        refresh_picker(picker, &self.config);
-                    }
-                }
-            }
-            KeyCode::Char('h') if key.modifiers.is_empty() && !picker.filter_mode => {
-                if let Some(parent) = picker.browse_root.parent() {
-                    picker.browse_root = parent.to_path_buf();
-                    picker.cursor = 0;
-                    refresh_picker(picker, &self.config);
-                }
-            }
-            KeyCode::Down => {
-                if picker.cursor + 1 < picker.entries.len() {
-                    picker.cursor += 1;
-                }
-            }
-            KeyCode::Up => {
-                picker.cursor = picker.cursor.saturating_sub(1);
-            }
-            KeyCode::Char('j') if key.modifiers.is_empty() && !picker.filter_mode => {
-                if picker.cursor + 1 < picker.entries.len() {
-                    picker.cursor += 1;
-                }
-            }
-            KeyCode::Char('k') if key.modifiers.is_empty() && !picker.filter_mode => {
-                picker.cursor = picker.cursor.saturating_sub(1);
-            }
-            KeyCode::Char('/') if key.modifiers.is_empty() && !picker.filter_mode => {
-                picker.filter_mode = true;
-            }
-            KeyCode::Backspace => {
-                picker.input.pop();
-                if picker.input.is_empty() {
-                    picker.filter_mode = false;
-                }
-                picker.cursor = 0;
-                refresh_picker(picker, &self.config);
-            }
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && picker_char_is_filter(picker.filter_mode, c) =>
-            {
-                picker.filter_mode = true;
-                picker.input.push(c);
-                picker.cursor = 0;
-                refresh_picker(picker, &self.config);
-            }
-            _ => {}
         }
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => {
-                self.overlay = Overlay::Flags;
-            }
+            KeyCode::Esc => self.overlay = Overlay::Flags,
             KeyCode::Enter => {
                 self.commit_edit();
                 self.overlay = Overlay::Flags;
             }
-            KeyCode::Backspace => {
-                self.edit_buffer.pop();
+            _ => {
+                self.edit.handle_key(key);
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.edit_buffer.push(c);
-            }
-            _ => {}
         }
     }
 
     fn activate_flag_field(&mut self) {
         if self.flag_field.is_text() {
-            self.edit_buffer = flag_text(&self.flags, self.flag_field).unwrap_or_default();
+            self.edit = TextInput::new(flag_text(&self.flags, self.flag_field).unwrap_or_default());
             self.overlay = Overlay::EditField;
         } else if self.flag_field.is_cycle() {
-            self.nudge_flag(true);
+            self.nudge_flag();
         } else {
             match self.flag_field {
                 FlagField::RemoteControl => {
@@ -1011,7 +1448,7 @@ impl App {
         }
     }
 
-    fn nudge_flag(&mut self, _forward: bool) {
+    fn nudge_flag(&mut self) {
         match self.flag_field {
             FlagField::Mode => {
                 self.flags.mode = cycle_choice(self.flags.mode.as_deref(), MODES);
@@ -1033,7 +1470,7 @@ impl App {
     }
 
     fn commit_edit(&mut self) {
-        let value = nonempty_owned(&self.edit_buffer);
+        let value = nonempty_owned(&self.edit.text);
         match self.flag_field {
             FlagField::RunnerId => self.flags.runner_id = value,
             FlagField::SettingsFile => self.flags.settings_file = value,
@@ -1118,14 +1555,10 @@ impl App {
     }
 
     fn open_picker(&mut self, purpose: PickerPurpose) {
-        if purpose == PickerPurpose::AddDir && self.current_runner().is_none() {
-            self.log(LogKind::Error, "select a runner before adding a directory");
-            return;
-        }
         let browse_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut picker = DirPicker {
             purpose,
-            input: String::new(),
+            input: TextInput::default(),
             filter_mode: false,
             browse_root,
             cursor: 0,
@@ -1150,7 +1583,7 @@ impl App {
         }
         match purpose {
             PickerPurpose::Start => self.start_in(&path),
-            PickerPurpose::AddDir => self.add_dir(&path),
+            PickerPurpose::AddDir(runner) => self.add_dir(&runner, &path),
         }
     }
 
@@ -1174,21 +1607,17 @@ impl App {
                 cwd: cwd.to_path_buf(),
                 opts,
             },
-            format!("working… start in {}", display_path(cwd)),
+            format!("starting a runner in {}", display_path(cwd)),
         );
     }
 
     fn ask_confirm(&mut self, action: ConfirmAction) {
-        if self.current_runner().is_none() {
-            self.log(LogKind::Error, "no runner selected");
-            return;
-        }
         self.confirm = Some(action);
         self.overlay = Overlay::Confirm;
     }
 
     fn ask_remove_dir(&mut self) {
-        if self.busy {
+        if self.busy.is_some() {
             self.log(
                 LogKind::Info,
                 "wait for the current operation before removing a directory",
@@ -1203,7 +1632,7 @@ impl App {
             self.log(LogKind::Error, "no directory selected");
             return;
         };
-        let saved = find_launch_spec(runner.runner_id_flag(), runner.cwd.as_deref());
+        let saved = saved_launch_spec(&runner);
         let restart = match removal_restart_spec(&runner, &path, saved) {
             Ok(spec) => spec.map(Box::new),
             Err(err) => {
@@ -1244,8 +1673,8 @@ impl App {
 
     fn perform_confirm(&mut self, action: ConfirmAction) {
         match action {
-            ConfirmAction::Stop => self.stop_selected(),
-            ConfirmAction::Restart => self.restart_selected(),
+            ConfirmAction::Stop(runner) => self.stop(&runner),
+            ConfirmAction::Restart(runner) => self.restart(&runner),
             ConfirmAction::RemoveDir {
                 runner,
                 path,
@@ -1253,49 +1682,57 @@ impl App {
             } => {
                 self.remove_dir(runner, path, restart.map(|spec| *spec));
             }
+            ConfirmAction::SelfUpdate => match self.exe.clone() {
+                Some(exe) => self.submit(AmpJob::SelfUpdate { exe }, "updating lazyamp"),
+                None => self.log(
+                    LogKind::Error,
+                    "cannot locate the lazyamp executable; run `lazyamp update` in a shell",
+                ),
+            },
+            ConfirmAction::QuitAfterUpdate(tag) => {
+                self.exit_note = Some(format!(
+                    "lazyamp {tag} is installed. Run `lazyamp` to start it; your Amp runners kept running."
+                ));
+                self.should_quit = true;
+            }
         }
     }
 
-    fn stop_selected(&mut self) {
-        let Some(runner) = self.current_runner().cloned() else {
-            self.log(LogKind::Error, "no runner selected");
-            return;
-        };
-        match resolve_stop_pid(&runner) {
+    fn stop(&mut self, runner: &Runner) {
+        match resolve_stop_pid(runner) {
             Some(pid) => self.submit(
                 AmpJob::Stop {
                     pid,
                     runner_id: runner.runner_id_flag().map(str::to_string),
                     display_id: runner.display_id().to_string(),
                 },
-                format!("working… stop {}", runner.display_id()),
+                format!("stopping {}", runner.display_id()),
             ),
             None => self.log(
                 LogKind::Error,
                 format!(
-                    "could not determine PID for {}. `amp runner list` had no PID and no matching amp --no-tui process was found.",
+                    "no local process found for {}; it may run on another machine",
                     runner.display_id()
                 ),
             ),
         }
     }
 
-    fn restart_selected(&mut self) {
-        let Some(runner) = self.current_runner().cloned() else {
-            self.log(LogKind::Error, "no runner selected");
-            return;
-        };
-        let spec = match launch_spec_for_restart(&runner) {
+    fn restart(&mut self, runner: &Runner) {
+        let spec = match launch_spec_for_restart(runner) {
             Ok(spec) => spec,
             Err(err) => {
                 self.log(LogKind::Error, format!("cannot restart: {err:#}"));
                 return;
             }
         };
-        let Some(pid) = resolve_stop_pid(&runner) else {
+        let Some(pid) = resolve_stop_pid(runner) else {
             self.log(
                 LogKind::Error,
-                "cannot restart: no PID (see README for PID detection)",
+                format!(
+                    "cannot restart {}: no local process found",
+                    runner.display_id()
+                ),
             );
             return;
         };
@@ -1306,22 +1743,18 @@ impl App {
                 display_id: runner.display_id().to_string(),
                 spec,
             },
-            format!("working… restart {}", runner.display_id()),
+            format!("restarting {}", runner.display_id()),
         );
     }
 
-    fn add_dir(&mut self, path: &Path) {
-        let Some(runner) = self.current_runner().cloned() else {
-            self.log(LogKind::Error, "no runner selected");
-            return;
-        };
+    fn add_dir(&mut self, runner: &Runner, path: &Path) {
         self.submit(
             AmpJob::DirsAdd {
                 runner_id: runner.runner_id_flag().map(str::to_string),
                 display_id: runner.display_id().to_string(),
                 path: path.to_path_buf(),
             },
-            format!("working… add {}", display_path(path)),
+            format!("adding {}", display_path(path)),
         );
     }
 
@@ -1335,7 +1768,7 @@ impl App {
                 return;
             };
             let message = format!(
-                "working… remove {} and restart in {}",
+                "removing {} and restarting in {}",
                 display_path(&path),
                 display_path(&spec.cwd)
             );
@@ -1356,7 +1789,7 @@ impl App {
                 display_id: runner.display_id().to_string(),
                 path,
             },
-            format!("working… remove dir from {}", runner.display_id()),
+            format!("removing a directory from {}", runner.display_id()),
         );
     }
 
@@ -1383,12 +1816,31 @@ impl App {
         }
     }
 
+    /// Record a message in the history (`L`) and show it briefly in the status line.
     fn log(&mut self, kind: LogKind, text: impl Into<String>) {
         let text = text.into();
+        let until = Instant::now()
+            + if kind == LogKind::Error {
+                ERROR_TOAST_FOR
+            } else {
+                TOAST_FOR
+            };
+        self.toast = Some(Toast {
+            text: text.clone(),
+            kind,
+            until,
+        });
+        self.history(kind, text);
+    }
+
+    /// Record a message in the history only.
+    fn history(&mut self, kind: LogKind, text: impl Into<String>) {
         let time = Local::now().format("%H:%M:%S").to_string();
-        self.status = text.clone();
-        self.status_kind = kind;
-        self.log.push_back(LogLine { time, text, kind });
+        self.log.push_back(LogLine {
+            time,
+            text: text.into(),
+            kind,
+        });
         while self.log.len() > LOG_CAP {
             self.log.pop_front();
         }
@@ -1399,8 +1851,29 @@ fn resolve_stop_pid(runner: &Runner) -> Option<u32> {
     runner.pid.filter(|pid| *pid > 0)
 }
 
-fn picker_char_is_filter(filter_mode: bool, c: char) -> bool {
-    filter_mode || !matches!(c, 'h' | 'j' | 'k' | 'l')
+fn picker_move(picker: &mut DirPicker, delta: i32) {
+    let max = picker.entries.len().saturating_sub(1) as i32;
+    picker.cursor = (picker.cursor as i32 + delta).clamp(0, max) as usize;
+}
+
+fn picker_browse_into(picker: &mut DirPicker, config: &Config) {
+    if let Some(entry) = picker.entries.get(picker.cursor).cloned() {
+        if entry.path.is_dir() {
+            picker.browse_root = entry.path;
+            picker.input.clear();
+            picker.filter_mode = false;
+            picker.cursor = 0;
+            refresh_picker(picker, config);
+        }
+    }
+}
+
+fn picker_browse_up(picker: &mut DirPicker, config: &Config) {
+    if let Some(parent) = picker.browse_root.parent() {
+        picker.browse_root = parent.to_path_buf();
+        picker.cursor = 0;
+        refresh_picker(picker, config);
+    }
 }
 
 fn picker_selected_path(picker: &DirPicker) -> Option<PathBuf> {
@@ -1409,11 +1882,11 @@ fn picker_selected_path(picker: &DirPicker) -> Option<PathBuf> {
 
 fn refresh_picker(picker: &mut DirPicker, config: &Config) {
     picker.search_gen = picker.search_gen.wrapping_add(1);
-    let query = picker.input.trim();
+    let query = picker.input.text.trim();
     if query.is_empty() {
         picker.searching = false;
         picker.debounce_until = None;
-        picker.filter_mode = picker.filter_mode && !picker.input.is_empty();
+        picker.filter_mode = picker.filter_mode && !picker.input.text.is_empty();
         picker.entries = picker_entries_from_sources(
             "",
             &picker.browse_root,
@@ -1484,31 +1957,29 @@ fn picker_entries_from_sources(
 
 fn ranked_to_entry(ranked: RankedPath, browse_root: &Path) -> PickerEntry {
     let shown = display_path(&ranked.path);
-    let label = match ranked.source {
-        PathSource::Current => format!("current  {shown}"),
-        PathSource::Home => format!("home     {shown}"),
-        PathSource::Recent => format!("recent   {shown}"),
-        PathSource::Zoxide => format!("zoxide   {shown}"),
-        PathSource::Parent => format!("..       {shown}"),
+    let (tag, text) = match ranked.source {
+        PathSource::Current => ("current", shown),
+        PathSource::Home => ("home", shown),
+        PathSource::Recent => ("recent", shown),
+        PathSource::Zoxide => ("zoxide", shown),
+        PathSource::Parent => ("up", format!("../  {shown}")),
         PathSource::Browse => {
             let name = ranked
                 .path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| shown.clone());
-            format!("browse   {name}/")
+                .unwrap_or(shown);
+            ("", format!("{name}/"))
         }
-        PathSource::Nested => {
-            if let Ok(rel) = ranked.path.strip_prefix(browse_root) {
-                format!("nested   {}/", rel.display())
-            } else {
-                format!("nested   {shown}")
-            }
-        }
-        PathSource::Exact => format!("exact    {shown}"),
+        PathSource::Nested => match ranked.path.strip_prefix(browse_root) {
+            Ok(rel) => ("", format!("{}/", rel.display())),
+            Err(_) => ("", shown),
+        },
+        PathSource::Exact => ("typed", shown),
     };
     PickerEntry {
-        label,
+        tag,
+        text,
         path: ranked.path,
     }
 }
@@ -1529,9 +2000,21 @@ fn expand_path(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Path with the home directory shown as `~`. Also matches the resolved home
+/// (e.g. `/var/home/me` when `/home` is a symlink, as on Fedora Atomic).
 fn display_path(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(stripped) = path.strip_prefix(&home) {
+    static HOMES: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    let homes = HOMES.get_or_init(|| {
+        let mut homes: Vec<PathBuf> = dirs::home_dir().into_iter().collect();
+        if let Some(real) = homes.first().and_then(|h| std::fs::canonicalize(h).ok()) {
+            if !homes.contains(&real) {
+                homes.push(real);
+            }
+        }
+        homes
+    });
+    for home in homes {
+        if let Ok(stripped) = path.strip_prefix(home) {
             if stripped.as_os_str().is_empty() {
                 return "~".into();
             }
@@ -1582,8 +2065,11 @@ fn flag_value_display(flags: &StartDefaults, field: FlagField) -> String {
     }
 }
 
+/// `amp 0.0.17-g1 (released …)` → `0.0.17-g1`.
 fn amp_version_label(v: &str) -> &str {
-    v.trim().strip_prefix("amp ").unwrap_or(v.trim())
+    let v = v.trim();
+    let v = v.strip_prefix("amp ").unwrap_or(v);
+    v.split_whitespace().next().unwrap_or(v)
 }
 
 fn on_off(v: bool) -> String {
@@ -1611,505 +2097,6 @@ fn summarize_output(s: &str) -> String {
     }
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(8),
-            Constraint::Length(7),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    draw_title(frame, chunks[0], app);
-    draw_main(frame, chunks[1], app);
-    draw_log(frame, chunks[2], app);
-    draw_status(frame, chunks[3], app);
-
-    match app.overlay {
-        Overlay::Help => draw_help(frame, area, app),
-        Overlay::Flags => draw_flags(frame, area, app),
-        Overlay::Picker => draw_picker(frame, area, app),
-        Overlay::EditField => {
-            draw_flags(frame, area, app);
-            draw_edit(frame, area, app);
-        }
-        Overlay::Confirm => draw_confirm(frame, area, app),
-        Overlay::None => {}
-    }
-}
-
-fn draw_title(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let title = Line::from(vec![
-        Span::styled(
-            " lazyamp ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("v{}  ", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("amp "),
-        Span::styled(
-            amp_version_label(&app.amp_version),
-            Style::default().fg(Color::Green),
-        ),
-        Span::styled(
-            "   q quit  ? help  s start  x stop  r restart  f flags  u update",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(title), area);
-}
-
-fn draw_main(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-        .split(area);
-    draw_runners(frame, cols[0], app);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(cols[1]);
-    draw_dirs(frame, right[0], app);
-    draw_runner_log(frame, right[1], app);
-}
-
-fn pane_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
-    let border = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Span::styled(title, style))
-}
-
-fn draw_runners(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let focused = app.pane == Pane::Runners && app.overlay == Overlay::None;
-    let block = pane_block(" runners ", focused);
-    if app.runners.is_empty() {
-        let empty = Paragraph::new("No runners on this machine.\nPress s to start `amp --no-tui`.")
-            .style(Style::default().fg(Color::DarkGray))
-            .block(block);
-        frame.render_widget(empty, area);
-        return;
-    }
-    let items: Vec<ListItem> = app
-        .runners
-        .iter()
-        .map(|r| {
-            let pid = r
-                .pid
-                .map(|p| format!("pid {p}"))
-                .unwrap_or_else(|| "pid ?".into());
-            let n = r.dirs.len();
-            let health = runner_health_label(r);
-            let line = format!(
-                "{:<20}  {pid:<12}  {n} dir{}  {health}",
-                truncate(r.display_id(), 20),
-                if n == 1 { "" } else { "s" }
-            );
-            ListItem::new(line)
-        })
-        .collect();
-    let mut state = ListState::default();
-    state.select(Some(app.selected_runner));
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block)
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> "),
-        area,
-        &mut state,
-    );
-}
-
-fn draw_dirs(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let focused = app.pane == Pane::Dirs && app.overlay == Overlay::None;
-    let title = match app.current_runner() {
-        Some(r) => format!(" served dirs · {} ", r.display_id()),
-        None => " served dirs ".into(),
-    };
-    let block = pane_block(&title, focused);
-    let dirs = app.current_dirs();
-    if dirs.is_empty() {
-        let empty = Paragraph::new(
-            "No served directories recorded.\n\
-             a adds a served path (`amp runner dirs add`).\n\
-             s starts a runner in a working directory (start cwd).",
-        )
-        .style(Style::default().fg(Color::DarkGray))
-        .block(block);
-        frame.render_widget(empty, area);
-        return;
-    }
-    let items: Vec<ListItem> = dirs
-        .iter()
-        .map(|d| ListItem::new(display_path(d)))
-        .collect();
-    let mut state = ListState::default();
-    state.select(Some(app.selected_dir));
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block)
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> "),
-        area,
-        &mut state,
-    );
-}
-
-fn runner_health_label(runner: &Runner) -> &'static str {
-    if runner.from_amp_list {
-        "connected"
-    } else {
-        "local only"
-    }
-}
-
-fn draw_runner_log(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let (title, body) = match app.current_runner() {
-        Some(runner) => {
-            let path = runner_log_path(runner.runner_id_flag(), runner.cwd.as_deref());
-            let lines = tail_log_lines(&path, 8);
-            let title = format!(" runner log · {} ", display_path(&path));
-            let body = if lines.is_empty() {
-                format!("(empty or missing)\n{}", path.display())
-            } else {
-                lines.join("\n")
-            };
-            (title, body)
-        }
-        None => (
-            " runner log ".into(),
-            "Select a runner to see its last log lines.".into(),
-        ),
-    };
-    let block = pane_block(&title, false);
-    frame.render_widget(
-        Paragraph::new(body)
-            .style(Style::default().fg(Color::Gray))
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn draw_log(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let lines: Vec<Line> = app
-        .log
-        .iter()
-        .rev()
-        .take(inner_h)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|l| {
-            let color = match l.kind {
-                LogKind::Info => Color::Gray,
-                LogKind::Ok => Color::Green,
-                LogKind::Error => Color::Red,
-            };
-            Line::from(vec![
-                Span::styled(
-                    format!("{}  ", l.time),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(l.text.clone(), Style::default().fg(color)),
-            ])
-        })
-        .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(" log ", Style::default().fg(Color::Gray)));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn draw_status(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let style = match app.status_kind {
-        LogKind::Error => Style::default().fg(Color::Red),
-        LogKind::Ok => Style::default().fg(Color::Green),
-        LogKind::Info => {
-            if app.busy {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::Gray)
-            }
-        }
-    };
-    frame.render_widget(
-        Paragraph::new(format!(" {}", app.status)).style(style),
-        area,
-    );
-}
-
-fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let popup = centered(area, 72, 80);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" help  (esc · j/k scroll) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(
-        Paragraph::new(HELP_TEXT)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((app.help_scroll, 0)),
-        popup,
-    );
-}
-
-fn draw_flags(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let popup = centered(area, 70, 70);
-    frame.render_widget(Clear, popup);
-    let mut lines = vec![
-        Line::from("Start defaults (Enter/space to edit or cycle, s save, esc cancel)"),
-        Line::from(""),
-    ];
-    for field in FlagField::ALL {
-        let selected = field == app.flag_field;
-        let marker = if selected { ">" } else { " " };
-        let style = if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{marker} {:<28} {}",
-                field.label(),
-                flag_value_display(&app.flags, field)
-            ),
-            style,
-        )));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("saved at {}", app.config_path.display()),
-        Style::default().fg(Color::DarkGray),
-    )));
-    let block = Block::default()
-        .title(" flags ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
-}
-
-fn draw_edit(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let popup = centered(area, 60, 20);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(format!(
-            " edit {}  (enter confirm, esc cancel) ",
-            app.flag_field.label()
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-    frame.render_widget(
-        Paragraph::new(format!("{}_", app.edit_buffer)).block(block),
-        popup,
-    );
-}
-
-fn draw_picker(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let Some(picker) = app.picker.as_ref() else {
-        return;
-    };
-    let popup = centered(area, 76, 80);
-    frame.render_widget(Clear, popup);
-    let title = match picker.purpose {
-        PickerPurpose::Start => " start runner · pick start cwd ",
-        PickerPurpose::AddDir => " add served directory to selected runner ",
-    };
-    let outer = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(outer, popup);
-    let inner = popup.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    let mode = if picker.searching {
-        "searching"
-    } else if picker.filter_mode {
-        "filter"
-    } else {
-        "nav"
-    };
-    let input = Paragraph::new(format!("{}_", picker.input)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {mode} / path ")),
-    );
-    frame.render_widget(input, chunks[0]);
-
-    let items: Vec<ListItem> = picker
-        .entries
-        .iter()
-        .map(|e| ListItem::new(e.label.clone()))
-        .collect();
-    let mut state = ListState::default();
-    if !picker.entries.is_empty() {
-        state.select(Some(picker.cursor.min(picker.entries.len() - 1)));
-    }
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" matches "))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> "),
-        chunks[1],
-        &mut state,
-    );
-
-    let hint = Paragraph::new(
-        "/ recursive filter · zoxide if installed · hjkl browse children (nav) · enter select",
-    )
-    .alignment(Alignment::Center)
-    .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(hint, chunks[2]);
-}
-
-fn draw_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let Some(action) = app.confirm.as_ref() else {
-        return;
-    };
-    let popup = if matches!(
-        action,
-        ConfirmAction::RemoveDir {
-            restart: Some(_),
-            ..
-        }
-    ) {
-        centered(area, 80, 60)
-    } else {
-        centered(area, 60, 24)
-    };
-    frame.render_widget(Clear, popup);
-    let question = match action {
-        ConfirmAction::Stop => {
-            let id = app
-                .current_runner()
-                .map(|r| r.display_id().to_string())
-                .unwrap_or_else(|| "?".into());
-            format!("Stop runner `{id}`?  SIGTERM then SIGKILL if needed.")
-        }
-        ConfirmAction::Restart => {
-            let id = app
-                .current_runner()
-                .map(|r| r.display_id().to_string())
-                .unwrap_or_else(|| "?".into());
-            format!("Restart runner `{id}` using its saved launch spec?")
-        }
-        ConfirmAction::RemoveDir {
-            runner,
-            path,
-            restart,
-        } => {
-            if let Some(spec) = restart {
-                format!(
-                    "Remove primary directory `{}` from `{}`? New primary: `{}`. \
-                     This RESTARTS the runner and interrupts active threads. \
-                     The remaining served directories and saved flags are kept. No files are deleted.",
-                    display_path(path), runner.display_id(), display_path(&spec.cwd),
-                )
-            } else {
-                format!(
-                    "Remove served directory `{}` from `{}`?",
-                    display_path(path),
-                    runner.display_id()
-                )
-            }
-        }
-    };
-    let block = Block::default()
-        .title(" confirm  (y/enter · n/esc) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(question),
-            Line::from(""),
-            Line::from(Span::styled(
-                "y / Enter  confirm     n / Esc  cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .block(block)
-        .wrap(Wrap { trim: true }),
-        popup,
-    );
-}
-
-fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height_pct) / 2),
-            Constraint::Percentage(height_pct),
-            Constraint::Percentage((100 - height_pct) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_pct) / 2),
-            Constraint::Percentage(width_pct),
-            Constraint::Percentage((100 - width_pct) / 2),
-        ])
-        .split(v[1])[1]
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2135,20 +2122,18 @@ mod tests {
     fn amp_version_label_strips_prefix() {
         assert_eq!(amp_version_label("amp 0.0.0-stub"), "0.0.0-stub");
         assert_eq!(amp_version_label("1.2.3"), "1.2.3");
+        assert_eq!(
+            amp_version_label("0.0.1792022479-ge66e24 (released 2026-10-15T00:01:19.000Z, 1h ago)"),
+            "0.0.1792022479-ge66e24"
+        );
     }
 
-    #[test]
-    fn picker_hjkl_type_in_filter_mode_only() {
-        assert!(!picker_char_is_filter(false, 'h'));
-        assert!(!picker_char_is_filter(false, 'j'));
-        assert!(picker_char_is_filter(false, 's'));
-        assert!(picker_char_is_filter(true, 'h'));
-        assert!(picker_char_is_filter(true, 'l'));
-    }
-
-    fn test_app() -> (App, Receiver<AmpJob>) {
+    fn test_app() -> (App, Receiver<AmpJob>, Receiver<PollCmd>) {
         let (job_tx, jobs) = mpsc::channel();
+        let (poll_tx, polls) = mpsc::channel();
         let (_, ev_rx) = mpsc::channel();
+        let (_, poll_rx) = mpsc::channel();
+        let (_, update_rx) = mpsc::channel();
         let (picker_tx, _) = mpsc::channel();
         let (_, picker_rx) = mpsc::channel();
         (
@@ -2165,36 +2150,56 @@ mod tests {
                 picker: None,
                 flags: StartDefaults::default(),
                 flag_field: FlagField::RunnerId,
-                edit_buffer: String::new(),
+                edit: TextInput::default(),
                 log: VecDeque::new(),
-                status: String::new(),
-                status_kind: LogKind::Info,
+                toast: None,
                 amp_version: String::new(),
-                last_refresh: Instant::now(),
                 should_quit: false,
-                busy: false,
+                busy: None,
+                refreshing: false,
+                list_error: None,
                 help_scroll: 0,
+                log_scroll: 0,
+                runner_log: LogTail::default(),
+                latest_release: None,
+                exe: None,
+                exit_note: None,
+                started: Instant::now(),
+                hits: RefCell::new(HitMap::default()),
                 job_tx,
                 ev_rx,
+                poll_tx,
+                poll_rx,
+                update_rx,
                 picker_tx,
                 picker_rx,
             },
             jobs,
+            polls,
         )
+    }
+
+    fn runner(id: &str, pid: u32) -> Runner {
+        Runner {
+            id: id.into(),
+            pid: Some(pid),
+            cwd: Some(PathBuf::from("/old")),
+            dirs: vec![PathBuf::from("/old"), PathBuf::from("/next")],
+            from_amp_list: true,
+            from_local_scan: true,
+            ..Runner::default()
+        }
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
     #[test]
     fn directory_confirmation_can_cancel_and_keeps_the_confirmed_target() {
         for restart in [false, true] {
-            let (mut app, jobs) = test_app();
-            let runner = Runner {
-                id: "confirmed-box".into(),
-                pid: Some(4321),
-                cwd: Some(PathBuf::from("/old")),
-                dirs: vec![PathBuf::from("/old"), PathBuf::from("/next")],
-                from_amp_list: true,
-                from_local_scan: true,
-            };
+            let (mut app, jobs, _) = test_app();
+            let runner = runner("confirmed-box", 4321);
             let spec = LaunchSpec {
                 runner_id: Some(runner.id.clone()),
                 cwd: PathBuf::from("/next"),
@@ -2241,13 +2246,180 @@ mod tests {
 
     #[test]
     fn successful_dir_removal_refreshes_the_authoritative_list() {
-        let (mut app, jobs) = test_app();
+        let (mut app, _, polls) = test_app();
         app.handle_event(AmpEvent::DirsRemoveOk {
             id: "box".into(),
             path: PathBuf::from("/old"),
             out: "removed".into(),
         });
-        assert!(matches!(jobs.try_recv().unwrap(), AmpJob::Refresh));
+        assert!(matches!(polls.try_recv().unwrap(), PollCmd::Now));
+    }
+
+    #[test]
+    fn stop_confirmation_targets_the_runner_it_was_opened_for() {
+        let (mut app, jobs, _) = test_app();
+        app.runners = vec![runner("alpha", 1111), runner("beta", 2222)];
+        app.pane = Pane::Runners;
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.overlay, Overlay::Confirm);
+        // A background refresh drops alpha while the dialog is open; the
+        // selection now points at beta.
+        app.handle_poll(PollEvent::Snapshot {
+            runners: vec![runner("beta", 2222)],
+            list_error: None,
+        });
+        press(&mut app, KeyCode::Char('y'));
+        match jobs.try_recv().unwrap() {
+            AmpJob::Stop { pid, runner_id, .. } => {
+                assert_eq!(pid, 1111);
+                assert_eq!(runner_id.as_deref(), Some("alpha"));
+            }
+            _ => panic!("expected a stop job"),
+        }
+    }
+
+    #[test]
+    fn add_dir_picker_targets_the_runner_it_was_opened_for() {
+        let (mut app, jobs, _) = test_app();
+        let tmp = tempfile::tempdir().unwrap();
+        app.runners = vec![runner("alpha", 1111), runner("beta", 2222)];
+        app.pane = Pane::Runners;
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.overlay, Overlay::Picker);
+        app.handle_poll(PollEvent::Snapshot {
+            runners: vec![runner("beta", 2222)],
+            list_error: None,
+        });
+        for c in tmp.path().display().to_string().chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app.picker.as_mut().unwrap().entries.clear(); // use the typed path
+        press(&mut app, KeyCode::Enter);
+        match jobs.try_recv().unwrap() {
+            AmpJob::DirsAdd {
+                runner_id, path, ..
+            } => {
+                assert_eq!(runner_id.as_deref(), Some("alpha"));
+                assert_eq!(path, tmp.path());
+            }
+            _ => panic!("expected a dirs add job"),
+        }
+    }
+
+    #[test]
+    fn background_refresh_is_silent_and_never_blocks_actions() {
+        let (mut app, jobs, _) = test_app();
+        app.runners = vec![runner("alpha", 1111)];
+        app.pane = Pane::Runners;
+        for _ in 0..3 {
+            app.handle_poll(PollEvent::Snapshot {
+                runners: vec![runner("alpha", 1111)],
+                list_error: None,
+            });
+        }
+        assert!(
+            app.toast.is_none(),
+            "refresh must not touch the status line"
+        );
+        assert!(app.log.is_empty());
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(jobs.try_recv().unwrap(), AmpJob::Stop { .. }));
+
+        // A failing `amp runner list` is reported once, not on every poll.
+        for _ in 0..3 {
+            app.handle_poll(PollEvent::Snapshot {
+                runners: vec![runner("alpha", 1111)],
+                list_error: Some("boom".into()),
+            });
+        }
+        assert_eq!(
+            app.log.iter().filter(|l| l.text.contains("boom")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mouse_clicks_select_rows_and_press_footer_hints() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _, _) = test_app();
+        app.runners = vec![runner("alpha", 1111), runner("beta", 2222)];
+        app.pane = Pane::Runners;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view::draw(f, &app)).unwrap();
+
+        let click = |col, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let rows = app.hits.borrow().runners.area;
+        app.handle_mouse(click(rows.x + 3, rows.y + 1));
+        assert_eq!(app.current_runner().unwrap().id, "beta");
+
+        let dirs = app.hits.borrow().dirs.area;
+        app.handle_mouse(click(dirs.x + 3, dirs.y + 1));
+        assert_eq!(app.pane, Pane::Dirs);
+        assert_eq!(app.selected_dir, 1);
+
+        terminal.draw(|f| view::draw(f, &app)).unwrap();
+        let help = app
+            .hits
+            .borrow()
+            .buttons
+            .iter()
+            .find(|(_, code)| *code == KeyCode::Char('?'))
+            .map(|(rect, _)| *rect)
+            .expect("help hint in the footer");
+        app.handle_mouse(click(help.x, help.y));
+        assert_eq!(app.overlay, Overlay::Help);
+    }
+
+    #[test]
+    fn text_input_edits_at_the_cursor() {
+        let mut input = TextInput::new("~/códe");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        input.handle_key(key(KeyCode::Left));
+        input.handle_key(key(KeyCode::Left));
+        input.handle_key(key(KeyCode::Backspace)); // removes the multibyte 'ó'
+        assert_eq!(input.text, "~/cde");
+        input.handle_key(key(KeyCode::Char('o')));
+        assert_eq!(input.text, "~/code");
+        assert_eq!(input.cursor, "~/co".len());
+        input.handle_key(key(KeyCode::Home));
+        input.handle_key(key(KeyCode::Delete));
+        assert_eq!(input.text, "/code");
+    }
+
+    #[test]
+    fn picker_typing_always_searches_even_with_hjkl() {
+        let (mut app, _, _) = test_app();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("child")).unwrap();
+        app.open_picker(PickerPurpose::Start);
+        let picker = app.picker.as_mut().unwrap();
+        picker.browse_root = tmp.path().to_path_buf();
+        refresh_picker(picker, &app.config);
+        for c in "lazy".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.input.text, "lazy");
+        assert_eq!(picker.browse_root, tmp.path(), "typing must not browse");
+        // Clearing the query brings back arrow browsing.
+        press(&mut app, KeyCode::Esc);
+        let picker = app.picker.as_mut().unwrap();
+        picker.cursor = picker
+            .entries
+            .iter()
+            .position(|e| e.path == tmp.path().join("child"))
+            .expect("child listed");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.picker.as_ref().unwrap().browse_root,
+            tmp.path().join("child")
+        );
     }
 
     #[test]

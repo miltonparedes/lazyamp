@@ -4,6 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/miltonparedes/lazyamp/main/scripts/install.sh | sh
 #   curl -fsSL ... | VERSION=v0.1.1 sh
 #   sh install.sh --prefix /usr/local
+#   sh install.sh --bin-dir ~/bin
 #
 # VERSION must be passed to `sh`, not to `curl`. `VERSION=v0.1.1 curl … | sh`
 # sets the variable on curl only and does not pin the install.
@@ -18,25 +19,33 @@ usage() {
 Install lazyamp from GitHub Releases.
 
 Usage:
-  install.sh [--prefix DIR]
+  install.sh [--prefix DIR] [--bin-dir DIR] [--version TAG]
+
+Options:
+  --prefix DIR    Install the binary into DIR/bin.
+  --bin-dir DIR   Install the binary directly into DIR (overrides --prefix).
+  --version TAG   Release tag or semver to install. Same as VERSION.
 
 Environment:
   VERSION   Release tag or semver (e.g. v0.1.1 or 0.1.1). Default: latest.
             Pin with: curl -fsSL …/install.sh | VERSION=v0.1.1 sh
   PREFIX    Install prefix (binary goes in PREFIX/bin). Same as --prefix.
+  BIN_DIR   Install directory for the binary. Same as --bin-dir; takes
+            precedence over PREFIX.
   LAZYAMP_INSECURE_SKIP_VERIFY
             Set to 1 to skip sha256 checks (not recommended).
 
 Linux installs the musl static binary (x86_64/aarch64-unknown-linux-musl).
 macOS installs the native darwin archive.
 
-The binary is installed to PREFIX/bin, or /usr/local/bin if writable,
+The binary is installed to BIN_DIR, or PREFIX/bin, or /usr/local/bin if writable,
 or ~/.local/bin otherwise. The install is staged then renamed so a
 running lazyamp is not overwritten in place (avoids Text-file-busy).
 EOF
 }
 
 PREFIX="${PREFIX:-}"
+BIN_DIR="${BIN_DIR:-}"
 VERSION="${VERSION:-}"
 
 while [ $# -gt 0 ]; do
@@ -55,6 +64,18 @@ while [ $# -gt 0 ]; do
       ;;
     --prefix=*)
       PREFIX="${1#--prefix=}"
+      shift
+      ;;
+    --bin-dir)
+      if [ $# -lt 2 ]; then
+        echo "install.sh: --bin-dir requires a directory" >&2
+        exit 2
+      fi
+      BIN_DIR="$2"
+      shift 2
+      ;;
+    --bin-dir=*)
+      BIN_DIR="${1#--bin-dir=}"
       shift
       ;;
     --version)
@@ -189,6 +210,10 @@ verify_checksum() {
 }
 
 install_dir() {
+  if [ -n "$BIN_DIR" ]; then
+    echo "$BIN_DIR"
+    return
+  fi
   if [ -n "$PREFIX" ]; then
     echo "${PREFIX}/bin"
     return
@@ -203,15 +228,16 @@ install_dir() {
 atomic_install() {
   src="$1"
   dest_dir="$2"
-  dest="${dest_dir}/${BINARY}"
+  # not `dest`: POSIX sh has no locals and the caller's `dest` is the directory
+  dest_file="${dest_dir}/${BINARY}"
   staging="${dest_dir}/.${BINARY}.tmp.$$"
   mkdir -p "$dest_dir"
   cp "$src" "$staging"
   chmod 755 "$staging"
   # rename over the destination so a running binary is not overwritten in place
-  if ! mv -f "$staging" "$dest"; then
+  if ! mv -f "$staging" "$dest_file"; then
     rm -f "$staging"
-    echo "install.sh: failed to install ${dest}" >&2
+    echo "install.sh: failed to install ${dest_file}" >&2
     exit 1
   fi
 }

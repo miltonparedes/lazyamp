@@ -4,6 +4,7 @@ pub mod amp;
 pub mod config;
 pub mod dirpick;
 pub mod ui;
+pub mod update;
 
 /// Launch the terminal UI. Fails if the Amp CLI is not on `PATH`.
 pub fn run() -> anyhow::Result<()> {

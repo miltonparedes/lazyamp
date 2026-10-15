@@ -66,7 +66,7 @@ pub enum StopOutcome {
 }
 
 /// A runner discovered from `amp runner list` and/or local process scan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Runner {
     pub id: String,
     pub pid: Option<u32>,
@@ -74,6 +74,12 @@ pub struct Runner {
     pub dirs: Vec<PathBuf>,
     pub from_amp_list: bool,
     pub from_local_scan: bool,
+    /// File the process writes stdout to (runners started by lazyamp).
+    pub log_path: Option<PathBuf>,
+    /// The amp binary this process runs was replaced on disk (e.g. by `amp update`).
+    pub amp_outdated: bool,
+    /// Threads running, from the latest status line in the runner log.
+    pub threads: Option<u32>,
 }
 
 impl Runner {
@@ -129,24 +135,20 @@ impl AmpClient {
 
     /// List runners via `amp runner list`, then attach PIDs from a local scan.
     pub fn list_runners(&self) -> Result<Vec<Runner>> {
-        let listed = match self.list_from_amp() {
-            Ok(v) => v,
+        match self.list_from_amp() {
+            Ok(listed) => Ok(merge_with_local(listed)),
             Err(err) => {
-                let local = scan_local_amp_processes();
+                let local = merge_with_local(Vec::new());
                 if local.is_empty() {
                     return Err(err);
                 }
-                return Ok(merge_runners(Vec::new(), &local, &load_spawn_registry()));
+                Ok(local)
             }
-        };
-        Ok(merge_runners(
-            listed,
-            &scan_local_amp_processes(),
-            &load_spawn_registry(),
-        ))
+        }
     }
 
-    fn list_from_amp(&self) -> Result<Vec<Runner>> {
+    /// Raw `amp runner list` (spawns Amp: ~150 ms and a few hundred MB peak RSS).
+    pub fn list_from_amp(&self) -> Result<Vec<Runner>> {
         if let Ok(out) = self.run_ok(&["runner", "list", "--json"]) {
             let parsed = parse_runner_list(&out)?;
             if !parsed.is_empty() || looks_like_json(&out) {
@@ -233,7 +235,7 @@ impl AmpClient {
             cwd: cwd.to_path_buf(),
             options: opts.clone(),
         });
-        record_spawn(pid, opts, cwd);
+        record_spawn(pid, opts, cwd, &log_path);
         let health = probe_start_health(self, pid, opts.runner_id.as_deref(), &log_path);
         Ok(StartOutcome {
             pid,
@@ -322,21 +324,49 @@ pub fn looks_like_login_prompt(text: &str) -> bool {
         || lower.contains("starting login flow")
 }
 
+/// Bytes read from the end of a runner log; logs grow without bound.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
 /// Last `n` lines of a runner log (empty if the file is missing).
+/// Reads only the last [`LOG_TAIL_BYTES`] of the file.
 pub fn tail_log_lines(path: &Path, n: usize) -> Vec<String> {
-    let Ok(raw) = fs::read_to_string(path) else {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
         return Vec::new();
     };
-    let lines: Vec<&str> = raw.lines().collect();
-    lines
-        .iter()
-        .rev()
-        .take(n)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|s| s.to_string())
-        .collect()
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    // `take`: appends after the size check must not grow the read.
+    if file.take(len - start).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = raw.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        // The first line was cut by the seek.
+        lines.remove(0);
+    }
+    let skip = lines.len().saturating_sub(n);
+    lines[skip..].iter().map(|s| s.to_string()).collect()
+}
+
+/// Thread count from the latest Amp status line, e.g. `Running (2 threads running)`.
+pub fn running_threads(lines: &[String]) -> Option<u32> {
+    lines.iter().rev().find_map(|line| {
+        let open = line.rfind('(')?;
+        let inner = &line[open + 1..];
+        let inner = &inner[..inner.find(')')?];
+        let (count, rest) = inner.split_once(' ')?;
+        if matches!(rest, "thread running" | "threads running") {
+            count.parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 /// Build argv for `amp --no-tui` (without the binary name).
@@ -470,7 +500,7 @@ fn runner_from_json(value: Value) -> Option<Runner> {
         cwd,
         dirs,
         from_amp_list: true,
-        from_local_scan: false,
+        ..Runner::default()
     })
 }
 
@@ -578,12 +608,8 @@ pub fn parse_runner_text(output: &str) -> Vec<Runner> {
 
 fn runner_from_text_line(line: &str, header: Option<&[String]>) -> Runner {
     let mut runner = Runner {
-        id: String::new(),
-        pid: None,
-        cwd: None,
-        dirs: Vec::new(),
         from_amp_list: true,
-        from_local_scan: false,
+        ..Runner::default()
     };
     if let Some(headers) = header {
         let cols = split_columns(line);
@@ -1055,8 +1081,8 @@ pub fn merge_runners(
         .collect();
     if leftover_listed.len() == 1 && leftover_groups.len() == 1 {
         let gi = leftover_groups[0];
-        if groups[gi].runner_id().is_none() {
-            let idx = leftover_listed[0];
+        let idx = leftover_listed[0];
+        if groups[gi].runner_id().is_none() && pid_compatible(&listed[idx], &groups[gi]) {
             attach_group(&mut listed[idx], &groups[gi]);
             attached[gi] = true;
         }
@@ -1302,6 +1328,7 @@ fn find_cwd_attach(listed: &[Runner], used: &[bool], group: &LocalGroup) -> Opti
         .enumerate()
         .filter(|(i, runner)| {
             !used[*i]
+                && pid_compatible(runner, group)
                 && (runner.cwd.as_ref() == Some(&cwd) || runner.dirs.iter().any(|d| d == &cwd))
         })
         .map(|(i, _)| i)
@@ -1311,6 +1338,12 @@ fn find_cwd_attach(listed: &[Runner], used: &[bool], group: &LocalGroup) -> Opti
     } else {
         None
     }
+}
+
+/// A listed runner whose PID Amp reports is a different process than `group`.
+/// Attaching it anyway would point stop/restart at the wrong PID.
+fn pid_compatible(runner: &Runner, group: &LocalGroup) -> bool {
+    runner.pid.is_none_or(|pid| group.contains_pid(pid))
 }
 
 fn attach_group(runner: &mut Runner, group: &LocalGroup) {
@@ -1344,8 +1377,8 @@ fn runner_from_group(group: &LocalGroup) -> Runner {
         pid: preferred_group_pid(group),
         cwd,
         dirs,
-        from_amp_list: false,
         from_local_scan: true,
+        ..Runner::default()
     }
 }
 
@@ -1607,6 +1640,8 @@ fn sanitize_slug(s: &str) -> String {
     slug.trim_matches('_').to_string()
 }
 
+/// One process lazyamp spawned. New fields must be `#[serde(default)]` so state
+/// written by older releases keeps loading after `lazyamp update`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct SpawnRecord {
     pid: u32,
@@ -1614,6 +1649,26 @@ struct SpawnRecord {
     cwd: String,
     #[serde(default)]
     options: Option<StartOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_path: Option<PathBuf>,
+}
+
+impl SpawnRecord {
+    /// Records written before `log_path` existed used the spawn-time slug.
+    fn log_path(&self) -> PathBuf {
+        self.log_path.clone().unwrap_or_else(|| {
+            runner_log_path(self.started_runner_id(), Some(Path::new(&self.cwd)))
+        })
+    }
+
+    fn launch_spec(&self) -> Option<LaunchSpec> {
+        let options = self.options.clone()?;
+        Some(LaunchSpec {
+            runner_id: options.runner_id.clone().or_else(|| self.runner_id.clone()),
+            cwd: PathBuf::from(&self.cwd),
+            options,
+        })
+    }
 }
 
 fn spawn_registry_path() -> PathBuf {
@@ -1624,36 +1679,125 @@ fn launches_path() -> PathBuf {
     state_dir().join("launches.json")
 }
 
-fn load_spawn_registry() -> Vec<LocalProcess> {
-    load_spawn_raw()
-        .into_iter()
-        .filter_map(|r| verify_amp_identity(r.pid, r.runner_id.as_deref()).ok())
-        .collect()
-}
-
-fn record_spawn(pid: u32, opts: &StartOptions, cwd: &Path) {
-    let mut records = load_spawn_raw();
+fn record_spawn(pid: u32, opts: &StartOptions, cwd: &Path, log_path: &Path) {
+    let Ok(mut records) = read_state::<SpawnRecord>(&spawn_registry_path()) else {
+        return;
+    };
     records.retain(|r| r.pid != pid && verify_amp_identity(r.pid, r.runner_id.as_deref()).is_ok());
     records.push(SpawnRecord {
         pid,
         runner_id: opts.runner_id.clone(),
         cwd: cwd.display().to_string(),
         options: Some(opts.clone()),
+        log_path: Some(log_path.to_path_buf()),
     });
     save_spawn_raw(&records);
 }
 
+impl SpawnRecord {
+    /// Runner id this record was started with.
+    fn started_runner_id(&self) -> Option<&str> {
+        self.options
+            .as_ref()
+            .and_then(|o| o.runner_id.as_deref())
+            .or(self.runner_id.as_deref())
+    }
+
+    /// Whether the live process at this PID is still the one lazyamp started,
+    /// not a later process that reused the PID: same runner id and same cwd.
+    fn matches_process(&self, proc: &LocalProcess) -> bool {
+        let same_id = match (self.started_runner_id(), proc.runner_id.as_deref()) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => true,
+            _ => false,
+        };
+        let recorded = Path::new(&self.cwd);
+        let same_cwd = proc.cwd.as_deref().is_none_or(|live| {
+            live == recorded || fs::canonicalize(recorded).is_ok_and(|real| real == live)
+        });
+        same_id && same_cwd
+    }
+}
+
+/// Spawn records whose PID still runs the process lazyamp started.
+fn live_spawn_records() -> Vec<(SpawnRecord, LocalProcess)> {
+    load_spawn_raw()
+        .into_iter()
+        .filter_map(|r| {
+            let proc = verify_amp_identity(r.pid, r.started_runner_id()).ok()?;
+            r.matches_process(&proc).then_some((r, proc))
+        })
+        .collect()
+}
+
+/// Merge listed runners with a fresh local scan, then read per-process details
+/// (log file, thread count, outdated binary). Cheap: no Amp subprocess.
+pub fn merge_with_local(listed: Vec<Runner>) -> Vec<Runner> {
+    let records = live_spawn_records();
+    let spawned: Vec<LocalProcess> = records.iter().map(|(_, proc)| proc.clone()).collect();
+    let mut runners = merge_runners(listed, &scan_local_amp_processes(), &spawned);
+    for runner in &mut runners {
+        let Some(pid) = runner.pid else { continue };
+        runner.log_path = process_stdout_file(pid).or_else(|| {
+            records
+                .iter()
+                .find(|(r, _)| r.pid == pid)
+                .map(|(r, _)| r.log_path())
+        });
+        runner.threads = runner
+            .log_path
+            .as_deref()
+            .and_then(|p| running_threads(&tail_log_lines(p, 200)));
+        runner.amp_outdated = process_binary_replaced(pid);
+    }
+    runners
+}
+
+/// PIDs of local `amp --no-tui` processes, sorted. Used to notice starts/stops.
+pub fn local_amp_pids() -> Vec<u32> {
+    let mut pids: Vec<u32> = scan_local_amp_processes().iter().map(|p| p.pid).collect();
+    pids.sort_unstable();
+    pids
+}
+
+/// Regular file the process's stdout points to (Linux only).
+fn process_stdout_file(pid: u32) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let path = fs::read_link(format!("/proc/{pid}/fd/1")).ok()?;
+    path.is_file().then_some(path)
+}
+
+/// Linux marks `/proc/<pid>/exe` as ` (deleted)` once the binary is replaced,
+/// which is what `amp update` does to a running runner.
+fn process_binary_replaced(pid: u32) -> bool {
+    cfg!(target_os = "linux")
+        && fs::read_link(format!("/proc/{pid}/exe"))
+            .is_ok_and(|exe| exe.to_string_lossy().ends_with(" (deleted)"))
+}
+
 fn forget_spawn(pid: u32) {
-    let mut records = load_spawn_raw();
+    let Ok(mut records) = read_state::<SpawnRecord>(&spawn_registry_path()) else {
+        return;
+    };
     records.retain(|r| r.pid != pid);
     save_spawn_raw(&records);
 }
 
+/// Read a JSON state list. Missing is empty; unreadable is an error so callers
+/// never overwrite state they could not parse (e.g. written by a newer release).
+fn read_state<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
 fn load_spawn_raw() -> Vec<SpawnRecord> {
-    fs::read_to_string(spawn_registry_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    read_state(&spawn_registry_path()).unwrap_or_default()
 }
 
 fn save_spawn_raw(records: &[SpawnRecord]) {
@@ -1663,16 +1807,7 @@ fn save_spawn_raw(records: &[SpawnRecord]) {
 }
 
 fn load_launches() -> Vec<LaunchSpec> {
-    fs::read_to_string(launches_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn save_launches(specs: &[LaunchSpec]) {
-    if let Ok(raw) = serde_json::to_string_pretty(specs) {
-        let _ = atomic_write(&launches_path(), raw);
-    }
+    read_state(&launches_path()).unwrap_or_default()
 }
 
 fn same_launch_key(a: &LaunchSpec, b: &LaunchSpec) -> bool {
@@ -1685,10 +1820,24 @@ fn same_launch_key(a: &LaunchSpec, b: &LaunchSpec) -> bool {
 
 /// Remember the argv/cwd used to start a runner (survives stop for restart).
 pub fn persist_launch_spec(spec: &LaunchSpec) {
-    let mut specs = load_launches();
+    let Ok(mut specs) = read_state::<LaunchSpec>(&launches_path()) else {
+        return;
+    };
     specs.retain(|s| !same_launch_key(s, spec));
     specs.push(spec.clone());
-    save_launches(&specs);
+    if let Ok(raw) = serde_json::to_string_pretty(&specs) {
+        let _ = atomic_write(&launches_path(), raw);
+    }
+}
+
+/// Launch spec for this runner: the exact spawn record for its PID first (the
+/// process lazyamp actually started), then saved specs by runner-id / cwd.
+pub fn saved_launch_spec(runner: &Runner) -> Option<LaunchSpec> {
+    runner
+        .pid
+        .and_then(|pid| live_spawn_records().into_iter().find(|(r, _)| r.pid == pid))
+        .and_then(|(r, _)| r.launch_spec())
+        .or_else(|| find_launch_spec(runner.runner_id_flag(), runner.cwd.as_deref()))
 }
 
 /// Look up a saved launch spec by runner-id, then uniquely by cwd (no id).
@@ -1819,7 +1968,7 @@ fn resolved_dir(path: &Path, cwd: &Path) -> PathBuf {
 /// Resolve the spec used to restart `runner`. Prefers the saved launch spec,
 /// then the live process argv. Does not use global config defaults.
 pub fn launch_spec_for_restart(runner: &Runner) -> Result<LaunchSpec> {
-    if let Some(spec) = find_launch_spec(runner.runner_id_flag(), runner.cwd.as_deref()) {
+    if let Some(spec) = saved_launch_spec(runner) {
         validate_launch_spec(&spec)?;
         return Ok(spec);
     }
@@ -2173,7 +2322,7 @@ mac-mini (pid 4321)
             cwd: None,
             dirs: vec![PathBuf::from("/work")],
             from_amp_list: true,
-            from_local_scan: false,
+            ..Runner::default()
         }];
         let local = vec![LocalProcess {
             pid: 7,
@@ -2256,7 +2405,7 @@ mac-mini (pid 4321)
             cwd: Some(PathBuf::from("/work")),
             dirs: vec![PathBuf::from("/work")],
             from_amp_list: true,
-            from_local_scan: false,
+            ..Runner::default()
         }];
         let local = vec![LocalProcess {
             pid: 99,
@@ -2295,7 +2444,7 @@ mac-mini (pid 4321)
             cwd: cwd.map(PathBuf::from),
             dirs: cwd.map(|c| vec![PathBuf::from(c)]).unwrap_or_default(),
             from_amp_list: true,
-            from_local_scan: false,
+            ..Runner::default()
         }
     }
 
@@ -2621,5 +2770,141 @@ exit 1
                 .trim(),
             "removed"
         );
+    }
+
+    #[test]
+    fn idless_local_process_does_not_take_over_a_runner_with_another_pid() {
+        // Amp says stub-box is pid 4242; the only local runner is an unrelated
+        // process started without --runner-id. Stop must never target it.
+        let listed = vec![listed_runner("stub-box", Some(4242), Some("/work"))];
+        let local = vec![local_proc(777, None, Some("/work"), None)];
+        let merged = merge_runners(listed, &local, &[]);
+        let stub = merged.iter().find(|r| r.id == "stub-box").unwrap();
+        assert_eq!(stub.pid, Some(4242));
+        assert!(merged.iter().any(|r| r.pid == Some(777) && r.id.is_empty()));
+
+        // Without a listed pid the single leftover pair still attaches.
+        let listed = vec![listed_runner("box", None, Some("/elsewhere"))];
+        let merged = merge_runners(listed, &local, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pid, Some(777));
+    }
+
+    #[test]
+    fn running_threads_reads_the_latest_status_line() {
+        let lines: Vec<String> = [
+            "14:05:57 Slept idle thread (0 threads running)",
+            "https://ampcode.com/threads/T-1",
+            "14:15:19 Running (1 thread running)",
+            "14:16:05 Running (2 threads running)",
+            "https://ampcode.com/threads/T-2",
+            "14:17:00 something else (not a count)",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(running_threads(&lines), Some(2));
+        assert_eq!(running_threads(&lines[..1]), Some(0));
+        assert_eq!(running_threads(&["no status".to_string()]), None);
+    }
+
+    #[test]
+    fn tail_reads_only_the_end_of_large_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.log");
+        let mut body = String::new();
+        let mut n = 0;
+        while body.len() < 3 * LOG_TAIL_BYTES as usize {
+            body.push_str(&format!("line {n}\n"));
+            n += 1;
+        }
+        fs::write(&path, &body).unwrap();
+        let tail = tail_log_lines(&path, 3);
+        assert_eq!(
+            tail,
+            vec![
+                format!("line {}", n - 3),
+                format!("line {}", n - 2),
+                format!("line {}", n - 1)
+            ]
+        );
+        // Asking for more lines than the window holds never returns a partial first line.
+        let all = tail_log_lines(&path, usize::MAX);
+        assert!(all.first().unwrap().starts_with("line "));
+        assert_eq!(all.last().unwrap(), &format!("line {}", n - 1));
+    }
+
+    #[test]
+    fn legacy_spawn_record_points_at_the_log_it_was_started_with() {
+        // v0.1.1 format: no log_path. Started without --runner-id, so Amp later
+        // names it after the host ("box"), but its log is the cwd slug.
+        let raw = r#"[{"pid": 2748719, "runner_id": null,
+            "cwd": "/var/home/me/Workspaces/A/abantu",
+            "options": {"runner_id": null, "mode": null, "log_level": null,
+              "settings_file": null, "mcp_config": null, "visibility": null,
+              "remote_control_terminal": false, "extra_dirs": [],
+              "discover_dirs": false, "amp_env": false}}]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spawned.json");
+        fs::write(&path, raw).unwrap();
+        let records: Vec<SpawnRecord> = read_state(&path).unwrap();
+        let log = records[0].log_path();
+        assert_eq!(
+            log.file_name().unwrap(),
+            "var_home_me_Workspaces_A_abantu.log"
+        );
+        let spec = records[0].launch_spec().unwrap();
+        assert_eq!(spec.cwd, PathBuf::from("/var/home/me/Workspaces/A/abantu"));
+        assert_eq!(spec.runner_id, None);
+    }
+
+    #[test]
+    fn spawn_record_rejects_a_process_that_reused_its_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha_dir = tmp.path().join("alpha");
+        let beta_dir = tmp.path().join("beta");
+        fs::create_dir_all(&alpha_dir).unwrap();
+        fs::create_dir_all(&beta_dir).unwrap();
+        let record = SpawnRecord {
+            pid: 4242,
+            runner_id: Some("alpha".into()),
+            cwd: alpha_dir.display().to_string(),
+            options: Some(StartOptions {
+                runner_id: Some("alpha".into()),
+                ..StartOptions::default()
+            }),
+            log_path: None,
+        };
+        let live = |id: Option<&str>, cwd: &Path| LocalProcess {
+            pid: 4242,
+            runner_id: id.map(str::to_string),
+            cwd: Some(cwd.to_path_buf()),
+            extra_dirs: Vec::new(),
+            ppid: None,
+        };
+        assert!(record.matches_process(&live(Some("ALPHA"), &alpha_dir)));
+        assert!(!record.matches_process(&live(Some("beta"), &alpha_dir)));
+        assert!(!record.matches_process(&live(None, &alpha_dir)));
+        assert!(!record.matches_process(&live(Some("alpha"), &beta_dir)));
+        // /proc reports the resolved cwd; the record keeps the path as given.
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&alpha_dir, &link).unwrap();
+            let via_link = SpawnRecord {
+                cwd: link.display().to_string(),
+                ..record.clone()
+            };
+            assert!(via_link.matches_process(&live(Some("alpha"), &alpha_dir)));
+        }
+    }
+
+    #[test]
+    fn unreadable_state_is_an_error_not_an_empty_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.json");
+        assert!(read_state::<LaunchSpec>(&missing).unwrap().is_empty());
+        let corrupt = tmp.path().join("launches.json");
+        fs::write(&corrupt, "{ not json").unwrap();
+        assert!(read_state::<LaunchSpec>(&corrupt).is_err());
     }
 }
