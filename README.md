@@ -42,21 +42,6 @@ The mouse works too, if that's your thing.
 
 Settings live in `~/.config/lazyamp/config.toml`.
 
-## Orb development
-
-Amp runs `.agents/setup` when preparing a project snapshot. It installs missing
-Debian build prerequisites, stable Rust with rustfmt and Clippy (matching CI),
-fetches `Cargo.lock` dependencies, and builds all targets. Warm setup reuses the
-installed toolchain, crate cache, and Cargo build artifacts; it does not update
-Rust automatically (`rustup update stable` does that when needed).
-
-New login shells have Cargo on `PATH`. `.agents/resume` intentionally does nothing:
-there are no services to restart or project credentials to restore. Orbs already
-provide Amp; tests use fake Amp executables and need no login. Run the CI checks
-with `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, and
-`cargo test --locked`. The hooks must reach the project's default branch before
-future orbs can use them.
-
 ## License
 
 MIT
