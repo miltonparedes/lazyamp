@@ -60,6 +60,9 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
         }
         Overlay::Confirm => {
             if let Some(action) = &app.confirm {
+                if matches!(action, ConfirmAction::EnableShare) {
+                    draw_flags(frame, area, app);
+                }
                 draw_confirm(frame, area, app, action);
             }
         }
@@ -952,6 +955,11 @@ fn confirm_text(app: &App, action: &ConfirmAction) -> (&'static str, Color, Stri
                     .as_deref()
                     .map_or("this binary".to_string(), display_path),
             ),
+        ),
+        ConfirmAction::EnableShare => (
+            "Share with workspace",
+            BAD,
+            "Runners started with --share let everyone in your workspace run code on this machine as you, with your files, credentials, and logins. Only share with people you'd trust with a shell here.".into(),
         ),
         ConfirmAction::QuitAfterUpdate(tag) => (
             "lazyamp updated",

@@ -61,12 +61,24 @@ pub struct StartDefaults {
     /// `private`, `unlisted`, `workspace`, `group`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
+    /// Comma-separated thread features: `fast`, `plaid`, `pro`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<String>,
     #[serde(default)]
     pub remote_control_terminal: bool,
     #[serde(default)]
     pub discover_dirs: bool,
     #[serde(default)]
     pub amp_env: bool,
+    #[serde(default)]
+    pub desktop: bool,
+    #[serde(default)]
+    pub share: bool,
+    #[serde(default)]
+    pub share_network: bool,
+    /// Extra arguments appended verbatim, for Amp flags lazyamp does not model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
 }
 
 impl StartDefaults {
@@ -79,10 +91,15 @@ impl StartDefaults {
             settings_file: nonempty(self.settings_file.as_deref()),
             mcp_config: nonempty(self.mcp_config.as_deref()),
             visibility: nonempty(self.visibility.as_deref()),
+            features: nonempty(self.features.as_deref()),
             remote_control_terminal: self.remote_control_terminal,
             extra_dirs: Vec::new(),
             discover_dirs: self.discover_dirs,
             amp_env: self.amp_env,
+            desktop: self.desktop,
+            share: self.share,
+            share_network: self.share_network,
+            extra_args: self.extra_args.clone(),
         }
     }
 }
@@ -408,6 +425,7 @@ mode = ""
             remote_control_terminal: true,
             discover_dirs: true,
             amp_env: true,
+            ..StartDefaults::default()
         };
         let opts = defaults.to_start_options();
         assert_eq!(opts.runner_id.as_deref(), Some("box"));

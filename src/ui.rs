@@ -75,6 +75,8 @@ enum ConfirmAction {
         restart: Option<Box<LaunchSpec>>,
     },
     SelfUpdate,
+    /// Turning on `--share` lets workspace members run code as you.
+    EnableShare,
     /// lazyamp was replaced on disk; quit so the user starts the new version.
     /// (No in-place `exec`: it would drop the threads that reap runners this
     /// process started, leaving zombies that break a later stop/restart.)
@@ -193,24 +195,34 @@ enum FlagField {
     Mode,
     LogLevel,
     Visibility,
+    Features,
     SettingsFile,
     McpConfig,
     RemoteControl,
     DiscoverDirs,
     AmpEnv,
+    Desktop,
+    Share,
+    ShareNetwork,
+    ExtraArgs,
 }
 
 impl FlagField {
-    const ALL: [FlagField; 9] = [
+    const ALL: [FlagField; 14] = [
         FlagField::RunnerId,
         FlagField::Mode,
         FlagField::LogLevel,
         FlagField::Visibility,
+        FlagField::Features,
         FlagField::SettingsFile,
         FlagField::McpConfig,
         FlagField::RemoteControl,
         FlagField::DiscoverDirs,
         FlagField::AmpEnv,
+        FlagField::Desktop,
+        FlagField::Share,
+        FlagField::ShareNetwork,
+        FlagField::ExtraArgs,
     ];
 
     fn next(self) -> Self {
@@ -226,14 +238,11 @@ impl FlagField {
     fn is_text(self) -> bool {
         matches!(
             self,
-            FlagField::RunnerId | FlagField::SettingsFile | FlagField::McpConfig
-        )
-    }
-
-    fn is_cycle(self) -> bool {
-        matches!(
-            self,
-            FlagField::Mode | FlagField::LogLevel | FlagField::Visibility
+            FlagField::RunnerId
+                | FlagField::Features
+                | FlagField::SettingsFile
+                | FlagField::McpConfig
+                | FlagField::ExtraArgs
         )
     }
 
@@ -248,6 +257,11 @@ impl FlagField {
             FlagField::RemoteControl => "Remote control terminal",
             FlagField::DiscoverDirs => "Discover directories",
             FlagField::AmpEnv => "Use Amp env",
+            FlagField::Features => "Thread features",
+            FlagField::Desktop => "Share desktop",
+            FlagField::Share => "Share with workspace",
+            FlagField::ShareNetwork => "Share network",
+            FlagField::ExtraArgs => "Extra arguments",
         }
     }
 
@@ -262,6 +276,11 @@ impl FlagField {
             FlagField::RemoteControl => "--remote-control-terminal",
             FlagField::DiscoverDirs => "--discover-dirs",
             FlagField::AmpEnv => "--amp-env",
+            FlagField::Features => "--features",
+            FlagField::Desktop => "--desktop",
+            FlagField::Share => "--share",
+            FlagField::ShareNetwork => "--share-network",
+            FlagField::ExtraArgs => "verbatim",
         }
     }
 }
@@ -1434,17 +1453,8 @@ impl App {
         if self.flag_field.is_text() {
             self.edit = TextInput::new(flag_text(&self.flags, self.flag_field).unwrap_or_default());
             self.overlay = Overlay::EditField;
-        } else if self.flag_field.is_cycle() {
-            self.nudge_flag();
         } else {
-            match self.flag_field {
-                FlagField::RemoteControl => {
-                    self.flags.remote_control_terminal = !self.flags.remote_control_terminal;
-                }
-                FlagField::DiscoverDirs => self.flags.discover_dirs = !self.flags.discover_dirs,
-                FlagField::AmpEnv => self.flags.amp_env = !self.flags.amp_env,
-                _ => {}
-            }
+            self.nudge_flag();
         }
     }
 
@@ -1465,6 +1475,10 @@ impl App {
             }
             FlagField::DiscoverDirs => self.flags.discover_dirs = !self.flags.discover_dirs,
             FlagField::AmpEnv => self.flags.amp_env = !self.flags.amp_env,
+            FlagField::Desktop => self.flags.desktop = !self.flags.desktop,
+            FlagField::Share if !self.flags.share => self.ask_confirm(ConfirmAction::EnableShare),
+            FlagField::Share => self.flags.share = false,
+            FlagField::ShareNetwork => self.flags.share_network = !self.flags.share_network,
             _ => {}
         }
     }
@@ -1475,6 +1489,10 @@ impl App {
             FlagField::RunnerId => self.flags.runner_id = value,
             FlagField::SettingsFile => self.flags.settings_file = value,
             FlagField::McpConfig => self.flags.mcp_config = value,
+            FlagField::Features => self.flags.features = value,
+            FlagField::ExtraArgs => {
+                self.flags.extra_args = self.edit.text.split_whitespace().map(Into::into).collect()
+            }
             _ => {}
         }
     }
@@ -1657,8 +1675,12 @@ impl App {
     fn handle_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
-                self.confirm = None;
-                self.overlay = Overlay::None;
+                let from_flags = matches!(self.confirm.take(), Some(ConfirmAction::EnableShare));
+                self.overlay = if from_flags {
+                    Overlay::Flags
+                } else {
+                    Overlay::None
+                };
             }
             KeyCode::Enter | KeyCode::Char('y') => {
                 let action = self.confirm.take();
@@ -1689,6 +1711,10 @@ impl App {
                     "cannot locate the lazyamp executable; run `lazyamp update` in a shell",
                 ),
             },
+            ConfirmAction::EnableShare => {
+                self.flags.share = true;
+                self.overlay = Overlay::Flags;
+            }
             ConfirmAction::QuitAfterUpdate(tag) => {
                 self.exit_note = Some(format!(
                     "lazyamp {tag} is installed. Run `lazyamp` to start it; your Amp runners kept running."
@@ -2038,6 +2064,8 @@ fn flag_text(flags: &StartDefaults, field: FlagField) -> Option<String> {
         FlagField::RunnerId => flags.runner_id.clone(),
         FlagField::SettingsFile => flags.settings_file.clone(),
         FlagField::McpConfig => flags.mcp_config.clone(),
+        FlagField::Features => flags.features.clone(),
+        FlagField::ExtraArgs => Some(flags.extra_args.join(" ")),
         _ => None,
     }
 }
@@ -2062,6 +2090,12 @@ fn flag_value_display(flags: &StartDefaults, field: FlagField) -> String {
         FlagField::RemoteControl => on_off(flags.remote_control_terminal),
         FlagField::DiscoverDirs => on_off(flags.discover_dirs),
         FlagField::AmpEnv => on_off(flags.amp_env),
+        FlagField::Desktop => on_off(flags.desktop),
+        FlagField::Share => on_off(flags.share),
+        FlagField::ShareNetwork => on_off(flags.share_network),
+        FlagField::Features => flags.features.clone().unwrap_or_else(|| "(none)".into()),
+        FlagField::ExtraArgs if flags.extra_args.is_empty() => "(none)".into(),
+        FlagField::ExtraArgs => flags.extra_args.join(" "),
     }
 }
 

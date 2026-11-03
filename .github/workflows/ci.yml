@@ -44,3 +44,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --locked
+
+  e2e:
+    name: e2e (fake amp)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: command -v tmux || (sudo apt-get update -qq && sudo apt-get install -y -qq tmux)
+      - name: Restart keeps an external runner's flags
+        run: scripts/e2e.sh
