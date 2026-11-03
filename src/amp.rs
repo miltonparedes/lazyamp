@@ -22,10 +22,17 @@ pub struct StartOptions {
     pub settings_file: Option<String>,
     pub mcp_config: Option<String>,
     pub visibility: Option<String>,
+    /// Comma-separated thread features (`fast`, `plaid`, `pro`).
+    pub features: Option<String>,
     pub remote_control_terminal: bool,
     pub extra_dirs: Vec<PathBuf>,
     pub discover_dirs: bool,
     pub amp_env: bool,
+    pub desktop: bool,
+    pub share: bool,
+    pub share_network: bool,
+    /// Passed to Amp verbatim, for flags lazyamp does not model.
+    pub extra_args: Vec<String>,
 }
 
 /// Persisted argv + cwd used to start a specific runner.
@@ -109,6 +116,8 @@ pub struct LocalProcess {
     pub extra_dirs: Vec<PathBuf>,
     /// Parent PID when known (Linux `/proc` or `ps`). Used to collapse helpers.
     pub ppid: Option<u32>,
+    /// Full command line, kept so a restart can reuse every flag.
+    pub args: Vec<String>,
 }
 
 /// Located Amp binary plus helpers to invoke it.
@@ -378,20 +387,101 @@ pub fn start_runner_args(opts: &StartOptions) -> Vec<String> {
     push_opt(&mut args, "--settings-file", opts.settings_file.as_deref());
     push_opt(&mut args, "--mcp-config", opts.mcp_config.as_deref());
     push_opt(&mut args, "--visibility", opts.visibility.as_deref());
-    if opts.remote_control_terminal {
-        args.push("--remote-control-terminal".into());
+    push_opt(&mut args, "--features", opts.features.as_deref());
+    for (on, flag) in [
+        (opts.remote_control_terminal, "--remote-control-terminal"),
+        (opts.amp_env, "--amp-env"),
+        (opts.desktop, "--desktop"),
+        (opts.share, "--share"),
+        (opts.share_network, "--share-network"),
+    ] {
+        if on {
+            args.push(flag.into());
+        }
     }
-    if opts.discover_dirs {
-        args.push("--discover-dirs".into());
-    }
-    if opts.amp_env {
-        args.push("--amp-env".into());
-    }
+    args.extend(opts.extra_args.iter().cloned());
     for dir in &opts.extra_dirs {
         args.push("--dir".into());
         args.push(dir.display().to_string());
     }
+    // Last: a bare `--discover-dirs` takes an optional path, so nothing may follow it.
+    if opts.discover_dirs {
+        args.push("--discover-dirs".into());
+    }
     args
+}
+
+/// Inverse of [`start_runner_args`] for a full `amp --no-tui` cmdline (binary
+/// included). Flags lazyamp does not model are kept, in order, in `extra_args`
+/// so a restart reproduces the original runner.
+pub fn start_options_from_cmdline(args: &[String]) -> StartOptions {
+    let mut opts = StartOptions::default();
+    let mut iter = amp_cli_args(args).iter().peekable();
+    while let Some(arg) = iter.next() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let slot = match name {
+            "--runner-id" => Some(&mut opts.runner_id),
+            "--mode" | "-m" => Some(&mut opts.mode),
+            "--log-level" => Some(&mut opts.log_level),
+            "--settings-file" => Some(&mut opts.settings_file),
+            "--mcp-config" => Some(&mut opts.mcp_config),
+            "--visibility" => Some(&mut opts.visibility),
+            "--features" => Some(&mut opts.features),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            *slot = inline
+                .or_else(|| iter.next().cloned())
+                .filter(|v| !v.is_empty());
+            continue;
+        }
+        let toggle = match (name, inline.is_some()) {
+            ("--remote-control-terminal", false) => Some(&mut opts.remote_control_terminal),
+            ("--amp-env", false) => Some(&mut opts.amp_env),
+            ("--desktop", false) => Some(&mut opts.desktop),
+            ("--share", false) => Some(&mut opts.share),
+            ("--share-network", false) => Some(&mut opts.share_network),
+            _ => None,
+        };
+        if let Some(toggle) = toggle {
+            *toggle = true;
+            continue;
+        }
+        match name {
+            "--no-tui" if inline.is_none() => {}
+            "--dir" => {
+                if let Some(dir) = inline.or_else(|| iter.next().cloned()) {
+                    opts.extra_dirs.push(PathBuf::from(dir));
+                }
+            }
+            // A bare `--discover-dirs` scans the cwd; with a path it is kept verbatim.
+            "--discover-dirs" if inline.is_none() => match iter.peek() {
+                Some(path) if !path.starts_with('-') => {
+                    opts.extra_args.push(arg.clone());
+                    opts.extra_args.push(iter.next().unwrap().clone());
+                }
+                _ => opts.discover_dirs = true,
+            },
+            _ => opts.extra_args.push(arg.clone()),
+        }
+    }
+    opts
+}
+
+/// Arguments after the Amp binary (or after the script for `node amp.js …`).
+fn amp_cli_args(args: &[String]) -> &[String] {
+    let Some(first) = args.first() else {
+        return args;
+    };
+    if is_js_runtime_name(&file_name_lower(first)) {
+        if let Some(i) = args[1..].iter().position(|a| !a.starts_with('-')) {
+            return &args[i + 2..];
+        }
+    }
+    &args[1..]
 }
 
 pub fn dirs_list_args(runner_id: Option<&str>) -> Vec<String> {
@@ -837,6 +927,7 @@ pub fn parse_amp_cmdline(args: &[String]) -> Option<LocalProcess> {
         cwd: None,
         extra_dirs: flag_values(args, "--dir"),
         ppid: None,
+        args: args.to_vec(),
     })
 }
 
@@ -1581,6 +1672,7 @@ fn inspect_linux(pid: u32) -> Result<LocalProcess> {
                 cwd: fs::read_link(proc_dir.join("cwd")).ok(),
                 extra_dirs: flag_values(&args, "--dir"),
                 ppid: linux_ppid(&proc_dir),
+                args: args.clone(),
             };
             proc.pid = pid;
             return Ok(proc);
@@ -1980,14 +2072,11 @@ pub fn launch_spec_for_restart(runner: &Runner) -> Result<LaunchSpec> {
                 .or_else(|| runner.cwd.clone())
                 .or_else(|| runner.dirs.first().cloned())
                 .ok_or_else(|| anyhow!("cannot restart: no working directory for this runner"))?;
-            let opts = StartOptions {
-                runner_id: proc
-                    .runner_id
-                    .clone()
-                    .or_else(|| runner.runner_id_flag().map(str::to_string)),
-                extra_dirs: proc.extra_dirs,
-                ..StartOptions::default()
-            };
+            // Started outside lazyamp: keep all of its flags (--share, --desktop, …).
+            let mut opts = start_options_from_cmdline(&proc.args);
+            if opts.runner_id.is_none() {
+                opts.runner_id = runner.runner_id_flag().map(str::to_string);
+            }
             let spec = LaunchSpec {
                 runner_id: opts.runner_id.clone(),
                 cwd,
@@ -2107,6 +2196,7 @@ mod tests {
             extra_dirs: vec![PathBuf::from("/work/a"), PathBuf::from("/work/b")],
             discover_dirs: true,
             amp_env: true,
+            ..StartOptions::default()
         };
         assert_eq!(
             start_runner_args(&opts),
@@ -2125,14 +2215,77 @@ mod tests {
                 "--visibility",
                 "private",
                 "--remote-control-terminal",
-                "--discover-dirs",
                 "--amp-env",
                 "--dir",
                 "/work/a",
                 "--dir",
                 "/work/b",
+                "--discover-dirs",
             ]
         );
+    }
+
+    #[test]
+    fn cmdline_round_trips_every_flag_and_keeps_unknown_ones() {
+        let cmdline: Vec<String> = [
+            "/usr/local/bin/amp",
+            "--no-tui",
+            "--runner-id=mac-builder",
+            "-m",
+            "claude-code",
+            "--share",
+            "--desktop",
+            "--features",
+            "fast,pro",
+            "--amp-env",
+            "--log-file",
+            "/tmp/amp.log",
+            "--discover-dirs",
+            "/src",
+            "--dir",
+            "/work/a",
+            "--future-flag",
+        ]
+        .map(String::from)
+        .to_vec();
+        let opts = start_options_from_cmdline(&cmdline);
+        assert_eq!(opts.runner_id.as_deref(), Some("mac-builder"));
+        assert_eq!(opts.mode.as_deref(), Some("claude-code"));
+        assert_eq!(opts.features.as_deref(), Some("fast,pro"));
+        assert!(opts.share && opts.desktop && opts.amp_env);
+        assert!(!opts.share_network && !opts.discover_dirs);
+        assert_eq!(opts.extra_dirs, vec![PathBuf::from("/work/a")]);
+        assert_eq!(
+            opts.extra_args,
+            [
+                "--log-file",
+                "/tmp/amp.log",
+                "--discover-dirs",
+                "/src",
+                "--future-flag"
+            ]
+        );
+        // Restarting with these options must not drop anything the runner had.
+        let mut rebuilt = start_runner_args(&opts);
+        rebuilt.insert(0, "amp".into());
+        assert_eq!(start_options_from_cmdline(&rebuilt), opts);
+    }
+
+    #[test]
+    fn cmdline_bare_discover_dirs_and_node_wrapper() {
+        let cmdline: Vec<String> = [
+            "node",
+            "--enable-source-maps",
+            "/opt/amp/amp.js",
+            "--no-tui",
+            "--discover-dirs",
+            "--share-network",
+        ]
+        .map(String::from)
+        .to_vec();
+        let opts = start_options_from_cmdline(&cmdline);
+        assert!(opts.discover_dirs && opts.share_network);
+        assert!(opts.extra_args.is_empty(), "{:?}", opts.extra_args);
     }
 
     #[test]
@@ -2330,6 +2483,7 @@ mac-mini (pid 4321)
             cwd: Some(PathBuf::from("/work")),
             extra_dirs: Vec::new(),
             ppid: None,
+            args: Vec::new(),
         }];
         let merged = merge_runners(listed, &local, &[]);
         assert_eq!(merged[0].pid, Some(7));
@@ -2345,6 +2499,7 @@ mac-mini (pid 4321)
             cwd: Some(PathBuf::from("/tmp")),
             extra_dirs: Vec::new(),
             ppid: None,
+            args: Vec::new(),
         }];
         let merged = merge_runners(Vec::new(), &local, &[]);
         assert_eq!(merged.len(), 1);
@@ -2413,6 +2568,7 @@ mac-mini (pid 4321)
             cwd: Some(PathBuf::from("/work")),
             extra_dirs: Vec::new(),
             ppid: None,
+            args: Vec::new(),
         }];
         let merged = merge_runners(listed, &local, &[]);
         assert_eq!(merged.len(), 2);
@@ -2434,6 +2590,7 @@ mac-mini (pid 4321)
             cwd: cwd.map(PathBuf::from),
             extra_dirs: Vec::new(),
             ppid,
+            args: Vec::new(),
         }
     }
 
@@ -2554,9 +2711,9 @@ mac-mini (pid 4321)
                 "alpha",
                 "--mode",
                 "high",
-                "--discover-dirs",
                 "--dir",
                 "/extra",
+                "--discover-dirs",
             ]
         );
         assert_ne!(opts.mode.as_deref(), Some("low"));
@@ -2880,6 +3037,7 @@ exit 1
             cwd: Some(cwd.to_path_buf()),
             extra_dirs: Vec::new(),
             ppid: None,
+            args: Vec::new(),
         };
         assert!(record.matches_process(&live(Some("ALPHA"), &alpha_dir)));
         assert!(!record.matches_process(&live(Some("beta"), &alpha_dir)));
