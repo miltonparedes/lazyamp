@@ -12,6 +12,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: version bumped
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags
+      - name: Cargo.toml is newer than the latest release
+        run: scripts/check-version.sh
+
   fmt:
     name: cargo fmt --check
     runs-on: ubuntu-latest
