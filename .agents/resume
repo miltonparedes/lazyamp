@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# No services or thread-specific authentication to restore. Toolchains and
+# dependencies live in the snapshot; keep wake-up free of installs and builds.
