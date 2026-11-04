@@ -186,7 +186,7 @@ enum PickerPurpose {
     Start,
     /// Captured when the picker opens, so a refresh that changes the selection
     /// cannot redirect the directory to another runner.
-    AddDir(Runner),
+    AddDir(Box<Runner>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1349,7 +1349,7 @@ impl App {
                 }
             }
             KeyCode::Char('a') => match self.current_runner().cloned() {
-                Some(runner) => self.open_picker(PickerPurpose::AddDir(runner)),
+                Some(runner) => self.open_picker(PickerPurpose::AddDir(Box::new(runner))),
                 None => self.log(LogKind::Error, "select a runner before adding a directory"),
             },
             KeyCode::Char('d') => self.ask_remove_dir(),
@@ -1378,7 +1378,6 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
             KeyCode::Char('j') | KeyCode::Down => self.flag_field = self.flag_field.next(),
             KeyCode::Char('k') | KeyCode::Up => self.flag_field = self.flag_field.prev(),
-            KeyCode::Char('s') => self.save_flags(),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_flag_field(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('h') | KeyCode::Left => {
                 self.nudge_flag()
@@ -1481,6 +1480,7 @@ impl App {
             FlagField::ShareNetwork => self.flags.share_network = !self.flags.share_network,
             _ => {}
         }
+        self.save_flags();
     }
 
     fn commit_edit(&mut self) {
@@ -1495,9 +1495,15 @@ impl App {
             }
             _ => {}
         }
+        self.save_flags();
     }
 
+    /// Every change in the flags panel is written immediately, so closing the
+    /// panel or quitting can never drop it.
     fn save_flags(&mut self) {
+        if self.flags == self.config.defaults {
+            return;
+        }
         if let Some(id) = self.flags.runner_id.as_deref() {
             if !is_plausible_runner_id(id) {
                 self.log(
@@ -1524,7 +1530,6 @@ impl App {
                     LogKind::Ok,
                     format!("saved defaults to {}", self.config_path.display()),
                 );
-                self.overlay = Overlay::None;
             }
             Err(err) => self.log(LogKind::Error, format!("save failed: {err:#}")),
         }
@@ -1713,6 +1718,7 @@ impl App {
             },
             ConfirmAction::EnableShare => {
                 self.flags.share = true;
+                self.save_flags();
                 self.overlay = Overlay::Flags;
             }
             ConfirmAction::QuitAfterUpdate(tag) => {
@@ -2279,6 +2285,25 @@ mod tests {
     }
 
     #[test]
+    fn flag_changes_persist_without_an_explicit_save() {
+        let (mut app, _, _) = test_app();
+        let tmp = tempfile::tempdir().unwrap();
+        app.config_path = tmp.path().join("config.toml");
+        app.config_writable = true;
+        app.pane = Pane::Runners;
+        press(&mut app, KeyCode::Char('f'));
+        while app.flag_field != FlagField::Desktop {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        let saved = Config::load_from(&app.config_path).unwrap().config;
+        assert!(saved.defaults.desktop);
+        assert!(app.start_options().desktop);
+    }
+
+    #[test]
     fn successful_dir_removal_refreshes_the_authoritative_list() {
         let (mut app, _, polls) = test_app();
         app.handle_event(AmpEvent::DirsRemoveOk {
@@ -2408,6 +2433,30 @@ mod tests {
             .expect("help hint in the footer");
         app.handle_mouse(click(help.x, help.y));
         assert_eq!(app.overlay, Overlay::Help);
+    }
+
+    #[test]
+    fn launch_flags_show_the_runners_own_flags_not_the_defaults() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _, _) = test_app();
+        app.config.defaults.mode = Some("low".into());
+        let mut started = runner("alpha", 1111);
+        started.launch = Some(StartOptions {
+            desktop: true,
+            ..StartOptions::default()
+        });
+        app.runners = vec![started];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view::draw(f, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("--desktop"));
+        assert!(!screen.contains("--mode"), "defaults must not leak in");
     }
 
     #[test]
