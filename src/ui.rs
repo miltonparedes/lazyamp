@@ -186,7 +186,7 @@ enum PickerPurpose {
     Start,
     /// Captured when the picker opens, so a refresh that changes the selection
     /// cannot redirect the directory to another runner.
-    AddDir(Runner),
+    AddDir(Box<Runner>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1349,7 +1349,7 @@ impl App {
                 }
             }
             KeyCode::Char('a') => match self.current_runner().cloned() {
-                Some(runner) => self.open_picker(PickerPurpose::AddDir(runner)),
+                Some(runner) => self.open_picker(PickerPurpose::AddDir(Box::new(runner))),
                 None => self.log(LogKind::Error, "select a runner before adding a directory"),
             },
             KeyCode::Char('d') => self.ask_remove_dir(),
@@ -2433,6 +2433,30 @@ mod tests {
             .expect("help hint in the footer");
         app.handle_mouse(click(help.x, help.y));
         assert_eq!(app.overlay, Overlay::Help);
+    }
+
+    #[test]
+    fn launch_flags_show_the_runners_own_flags_not_the_defaults() {
+        use ratatui::backend::TestBackend;
+        let (mut app, _, _) = test_app();
+        app.config.defaults.mode = Some("low".into());
+        let mut started = runner("alpha", 1111);
+        started.launch = Some(StartOptions {
+            desktop: true,
+            ..StartOptions::default()
+        });
+        app.runners = vec![started];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view::draw(f, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("--desktop"));
+        assert!(!screen.contains("--mode"), "defaults must not leak in");
     }
 
     #[test]

@@ -87,6 +87,8 @@ pub struct Runner {
     pub amp_outdated: bool,
     /// Threads running, from the latest status line in the runner log.
     pub threads: Option<u32>,
+    /// Flags the local process runs with; `None` when it is not running here.
+    pub launch: Option<StartOptions>,
 }
 
 impl Runner {
@@ -1827,9 +1829,21 @@ fn live_spawn_records() -> Vec<(SpawnRecord, LocalProcess)> {
 pub fn merge_with_local(listed: Vec<Runner>) -> Vec<Runner> {
     let records = live_spawn_records();
     let spawned: Vec<LocalProcess> = records.iter().map(|(_, proc)| proc.clone()).collect();
-    let mut runners = merge_runners(listed, &scan_local_amp_processes(), &spawned);
+    let local = scan_local_amp_processes();
+    let mut runners = merge_runners(listed, &local, &spawned);
     for runner in &mut runners {
         let Some(pid) = runner.pid else { continue };
+        runner.launch = records
+            .iter()
+            .find(|(r, _)| r.pid == pid)
+            .and_then(|(r, _)| r.launch_spec())
+            .map(|spec| restart_start_options(&spec))
+            .or_else(|| {
+                local
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .map(|p| start_options_from_cmdline(&p.args))
+            });
         runner.log_path = process_stdout_file(pid).or_else(|| {
             records
                 .iter()

@@ -5,13 +5,14 @@ use super::{
     HitMap, ListHit, LogKind, Overlay, Pane, PickerPurpose, TextInput,
 };
 use crate::amp::Runner;
+use crate::config::StartDefaults;
 use crate::update;
 use crossterm::event::KeyCode;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui::Frame;
 use std::path::Path;
@@ -23,6 +24,8 @@ const GOOD: Color = Color::Green;
 const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
 const SELECTED_BG: Color = Color::Indexed(237);
+/// Rows the runner strip grows to before it scrolls.
+const MAX_STRIP_ROWS: usize = 5;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// One footer hint or dialog button: key label, action label, key it sends.
@@ -118,18 +121,18 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Most machines run one or two runners, so they get a slim strip on top and
+/// the selected runner's details get the rest of the screen.
 fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
-    let (list, detail) = if area.width < 72 {
-        let [a, b] = Layout::vertical([Constraint::Percentage(40), Constraint::Min(6)]).areas(area);
-        (a, b)
-    } else {
-        let width = pct(area.width, 36).clamp(30, 48);
-        let [a, b] =
-            Layout::horizontal([Constraint::Length(width), Constraint::Min(30)]).areas(area);
-        (a, b)
-    };
-    draw_runners(frame, list, app);
-    draw_detail(frame, detail, app);
+    let rows = app.runners.len().clamp(1, MAX_STRIP_ROWS) as u16;
+    let strip_h = (rows + 2).min(area.height.saturating_sub(5)).max(3);
+    let [strip, rest] =
+        Layout::vertical([Constraint::Length(strip_h), Constraint::Min(0)]).areas(area);
+    draw_runners(frame, strip, app);
+    match app.current_runner() {
+        Some(runner) => draw_detail(frame, rest, app, runner),
+        None => draw_defaults(frame, rest, app),
+    }
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
@@ -168,10 +171,6 @@ fn runner_dot(runner: &Runner) -> Span<'static> {
     }
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
 fn draw_runners(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.pane == Pane::Runners && app.overlay == Overlay::None;
     let title = match app.runners.len() {
@@ -181,25 +180,21 @@ fn draw_runners(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block(title, focused);
     let inner = block.inner(area);
     if app.runners.is_empty() {
-        let text = if app.refreshing {
-            vec![Line::from(""), Line::from(muted("Looking for runners…"))]
+        let line = if app.refreshing {
+            Line::from(muted("Looking for runners…"))
         } else {
-            vec![
-                Line::from(""),
-                Line::from("No runners yet"),
-                Line::from(""),
-                Line::from(vec![
-                    muted("Press "),
-                    Span::styled(
-                        "s",
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
-                    muted(" to start one"),
-                ]),
-            ]
+            Line::from(vec![
+                Span::raw("No runners yet"),
+                muted("  ·  press "),
+                Span::styled(
+                    "s",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                muted(" to start one"),
+            ])
         };
         frame.render_widget(
-            Paragraph::new(text)
+            Paragraph::new(line)
                 .alignment(Alignment::Center)
                 .block(block),
             area,
@@ -209,22 +204,18 @@ fn draw_runners(frame: &mut Frame, area: Rect, app: &App) {
 
     // Room after the highlight symbol, keeping one column off the border.
     let width = usize::from(inner.width.saturating_sub(3));
+    let name_w = app
+        .runners
+        .iter()
+        .map(|r| Span::raw(r.display_id()).width())
+        .max()
+        .unwrap_or(0)
+        .clamp(8, 28)
+        .min(width / 3);
     let items: Vec<ListItem> = app
         .runners
         .iter()
-        .map(|runner| {
-            let name = runner.display_id();
-            let meta = runner_meta(runner, width.saturating_sub(2), Span::raw(name).width());
-            let meta_w = Span::raw(&meta).width();
-            let name = truncate(name, width.saturating_sub(meta_w + 3).max(4));
-            let pad = width.saturating_sub(2 + Span::raw(&name).width() + meta_w);
-            ListItem::new(Line::from(vec![
-                runner_dot(runner),
-                Span::raw(format!(" {name}")),
-                Span::raw(" ".repeat(pad)),
-                muted(meta),
-            ]))
-        })
+        .map(|runner| ListItem::new(runner_row(runner, width, name_w)))
         .collect();
     let mut state = ListState::default().with_selected(Some(app.selected_runner));
     frame.render_stateful_widget(
@@ -242,131 +233,155 @@ fn draw_runners(frame: &mut Frame, area: Rect, app: &App) {
     };
 }
 
-/// Right-hand row details, most important first; parts that would squeeze the
-/// name below 10 columns are dropped.
-fn runner_meta(runner: &Runner, room: usize, name_w: usize) -> String {
-    let mut parts = Vec::new();
-    if runner.amp_outdated {
-        parts.push("↻".to_string());
-    }
+/// `● name   Connected · 2 running · pid 4321          ~/code/app +2`.
+/// When space runs out the pid goes first, then the directory.
+fn runner_row(runner: &Runner, width: usize, name_w: usize) -> Line<'static> {
+    let name = truncate(runner.display_id(), name_w);
+    let name_pad = name_w.saturating_sub(Span::raw(&name).width());
+    let mut parts: Vec<Span<'static>> = vec![if runner.from_amp_list {
+        Span::raw("Connected")
+    } else {
+        Span::styled("Local only", Style::default().fg(DIM))
+    }];
     if let Some(n) = runner.threads.filter(|n| *n > 0) {
-        parts.push(format!("{n} running"));
+        parts.push(Span::raw(format!("{n} running")));
     }
-    parts.push(plural(runner.dirs.len(), "dir", "dirs"));
-    let budget = room.saturating_sub(name_w.min(10) + 1);
-    let mut shown: Vec<String> = Vec::new();
-    for part in parts {
-        let candidate = std::iter::once(part.clone())
-            .chain(shown.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(" · ");
-        if Span::raw(&candidate).width() > budget {
-            break;
+    if runner.amp_outdated {
+        parts.push(Span::styled(
+            "↻ restart to update",
+            Style::default().fg(WARN),
+        ));
+    }
+    let pid = runner.pid.map(|pid| muted(format!("pid {pid}")));
+    let dir = runner.cwd.as_ref().or(runner.dirs.first()).map(|cwd| {
+        let more = runner.dirs.iter().filter(|d| *d != cwd).count();
+        let more = if more > 0 {
+            format!(" +{more}")
+        } else {
+            String::new()
+        };
+        (display_path(cwd), more)
+    });
+
+    let room = width.saturating_sub(2 + name_w + 3);
+    let joined = |parts: &[Span<'static>]| {
+        parts.iter().map(Span::width).sum::<usize>() + 3 * parts.len().saturating_sub(1)
+    };
+    if let Some(pid) = pid.filter(|p| joined(&parts) + 3 + p.width() + 14 <= room) {
+        parts.push(pid);
+    }
+    let used = joined(&parts);
+    let dir_room = room.saturating_sub(used + 3);
+
+    let mut spans = vec![
+        runner_dot(runner),
+        Span::raw(format!(" {name}{}   ", " ".repeat(name_pad))),
+    ];
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(muted(" · "));
         }
-        shown.insert(0, part);
+        spans.push(part);
     }
-    shown.join(" · ")
+    if let Some((path, more)) = dir.filter(|_| dir_room >= 10) {
+        let path = truncate_start(&path, dir_room.saturating_sub(more.len()));
+        let pad = dir_room.saturating_sub(Span::raw(&path).width() + more.len());
+        spans.push(Span::raw(" ".repeat(pad + 3)));
+        spans.push(Span::styled(path, Style::default().fg(DIM)));
+        spans.push(muted(more));
+    }
+    Line::from(spans)
 }
 
-fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_detail(frame: &mut Frame, area: Rect, app: &App, runner: &Runner) {
     let focused = app.pane == Pane::Dirs && app.overlay == Overlay::None;
-    let Some(runner) = app.current_runner() else {
-        let block = pane_block(" Details ".into(), focused);
+    let flags = runner
+        .launch
+        .as_ref()
+        .map(|opts| flag_rows(&StartDefaults::from(opts)));
+    let flag_rows = flags.as_ref().map_or(1, |l| l.len().max(1)) as u16;
+    let dir_rows = runner.dirs.len().max(1) as u16;
+    let cap = (area.height / 2).max(5);
+
+    let (dirs_area, flags_area, activity_area) = if area.width >= 80 {
+        let top_h = (dir_rows.max(flag_rows) + 2).clamp(5, cap);
+        let [top, activity] =
+            Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(area);
+        let [dirs, flags] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(top);
+        (dirs, flags, activity)
+    } else {
+        let [dirs, flags, activity] = Layout::vertical([
+            Constraint::Length((dir_rows + 2).clamp(3, cap)),
+            Constraint::Length((flag_rows + 2).clamp(3, cap)),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+        (dirs, flags, activity)
+    };
+
+    draw_dirs(frame, dirs_area, app, runner, focused);
+
+    let block = pane_block(" Launch flags ".into(), false);
+    let inner = padded(block.inner(flags_area));
+    frame.render_widget(block, flags_area);
+    let body = match flags {
+        None => vec![Line::from(muted("Not running on this machine."))],
+        Some(rows) if rows.is_empty() => {
+            vec![Line::from(muted("Amp defaults, no extra flags."))]
+        }
+        Some(rows) => flag_lines(&rows, inner),
+    };
+    frame.render_widget(Paragraph::new(body), inner);
+
+    draw_activity(frame, activity_area, app, runner);
+}
+
+fn draw_dirs(frame: &mut Frame, area: Rect, app: &App, runner: &Runner, focused: bool) {
+    let dirs = &runner.dirs;
+    let block = pane_block(format!(" Directories {} ", dirs.len()), focused);
+    let inner = block.inner(area);
+    if dirs.is_empty() {
         frame.render_widget(
-            Paragraph::new(muted(
-                "Select a runner to see its directories and activity.",
-            ))
-            .wrap(Wrap { trim: true })
-            .block(block),
+            Paragraph::new(muted(" None reported. Press a to add one.")).block(block),
             area,
         );
         return;
-    };
-    let block = pane_block(format!(" {} ", runner.display_id()), focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let inner = Rect {
-        x: inner.x + 1,
-        width: inner.width.saturating_sub(2),
-        ..inner
-    };
-
-    let mut summary = vec![Line::from(runner_summary(runner))];
-    if runner.amp_outdated {
-        summary.push(Line::from(Span::styled(
-            "↻ amp was updated; this runner keeps the old version until it restarts. r restarts it now.",
-            Style::default().fg(WARN),
-        )));
     }
-    let summary_h = summary
+    let width = usize::from(inner.width.saturating_sub(5));
+    let items: Vec<ListItem> = dirs
         .iter()
-        .map(|l| (l.width() as u16).div_ceil(inner.width.max(1)).max(1))
-        .sum::<u16>();
-
-    let dirs = &runner.dirs;
-    let avail = inner.height.saturating_sub(summary_h + 4);
-    let dirs_h = (dirs.len().max(1) as u16).min((avail / 2).max(3));
-    let [summary_area, _, dirs_head, dirs_area, _, activity_head, activity_area] =
-        Layout::vertical([
-            Constraint::Length(summary_h),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(dirs_h),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .areas(inner);
-
-    frame.render_widget(
-        Paragraph::new(summary).wrap(Wrap { trim: true }),
-        summary_area,
+        .map(|dir| {
+            let primary = runner.cwd.as_deref() == Some(dir.as_path());
+            let mark = if primary {
+                Span::styled("★ ", Style::default().fg(WARN))
+            } else {
+                Span::raw("  ")
+            };
+            ListItem::new(Line::from(vec![
+                mark,
+                Span::raw(truncate_start(&display_path(dir), width)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(focused.then_some(app.selected_dir));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(highlight(true))
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always),
+        area,
+        &mut state,
     );
+    app.hits.borrow_mut().dirs = ListHit {
+        area: inner,
+        offset: state.offset(),
+        len: dirs.len(),
+    };
+}
 
-    frame.render_widget(
-        Paragraph::new(section_heading(
-            "Directories",
-            &plural(dirs.len(), "served", "served"),
-        )),
-        dirs_head,
-    );
-    if dirs.is_empty() {
-        frame.render_widget(
-            Paragraph::new(muted("None reported. Press a to add one.")),
-            dirs_area,
-        );
-    } else {
-        let width = usize::from(dirs_area.width.saturating_sub(4));
-        let items: Vec<ListItem> = dirs
-            .iter()
-            .map(|dir| {
-                let primary = runner.cwd.as_deref() == Some(dir.as_path());
-                let mark = if primary {
-                    Span::styled("★ ", Style::default().fg(WARN))
-                } else {
-                    Span::raw("  ")
-                };
-                ListItem::new(Line::from(vec![
-                    mark,
-                    Span::raw(truncate_start(&display_path(dir), width)),
-                ]))
-            })
-            .collect();
-        let mut state = ListState::default().with_selected(focused.then_some(app.selected_dir));
-        frame.render_stateful_widget(
-            List::new(items)
-                .highlight_style(highlight(true))
-                .highlight_symbol("› "),
-            dirs_area,
-            &mut state,
-        );
-        app.hits.borrow_mut().dirs = ListHit {
-            area: dirs_area,
-            offset: state.offset(),
-            len: dirs.len(),
-        };
-    }
-
+fn draw_activity(frame: &mut Frame, area: Rect, app: &App, runner: &Runner) {
     let log_name = app
         .runner_log
         .path
@@ -374,12 +389,16 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    frame.render_widget(
-        Paragraph::new(section_heading("Activity", &log_name)),
-        activity_head,
-    );
-    let height = usize::from(activity_area.height);
-    let width = usize::from(activity_area.width);
+    let title = if log_name.is_empty() {
+        " Activity ".to_string()
+    } else {
+        format!(" Activity · {log_name} ")
+    };
+    let block = pane_block(title, false);
+    let inner = padded(block.inner(area));
+    frame.render_widget(block, area);
+    let height = usize::from(inner.height);
+    let width = usize::from(inner.width);
     let lines: Vec<Line> = if runner.log_path.is_none() {
         vec![Line::from(muted(
             "No log: lazyamp captures output only for runners it started.",
@@ -393,39 +412,104 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             .map(|line| activity_line(line, width))
             .collect()
     };
-    frame.render_widget(Paragraph::new(lines), activity_area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn runner_summary(runner: &Runner) -> Vec<Span<'static>> {
-    let mut spans = vec![runner_dot(runner), Span::raw(" ")];
-    if runner.from_amp_list {
-        spans.push(Span::raw("Connected"));
-    } else {
-        spans.push(Span::raw("Local process"));
-        spans.push(muted(" (not in amp runner list)".replace(' ', "\u{a0}")));
+/// With no runners yet, show what the next `s` will start with.
+fn draw_defaults(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = flag_rows(&app.config.defaults);
+    let height = (rows.len().max(1) as u16 + 4).min(area.height);
+    let width = area.width.min(72);
+    let area = Rect {
+        width,
+        height,
+        ..area
+    };
+    let block = pane_block(" Defaults for new runners ".into(), false);
+    let inner = padded(block.inner(area));
+    frame.render_widget(block, area);
+    let mut lines = flag_lines(&rows, inner);
+    if lines.is_empty() {
+        lines.push(Line::from(muted("Amp defaults, no extra flags.")));
     }
-    if let Some(n) = runner.threads {
-        spans.push(muted("  ·  "));
-        spans.push(Span::raw(plural(
-            n as usize,
-            "thread running",
-            "threads running",
-        )));
-    }
-    if let Some(pid) = runner.pid {
-        spans.push(muted(format!("  ·  pid\u{a0}{pid}")));
-    }
-    spans
-}
-
-fn section_heading(title: &str, detail: &str) -> Line<'static> {
-    Line::from(vec![
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
         Span::styled(
-            title.to_string(),
-            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            "f",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        muted(format!("  {detail}")),
-    ])
+        muted(" to change them"),
+    ]));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `(name, value, --flag)` for each flag that differs from Amp's default.
+/// The runner ID is left out: the runner strip already shows it.
+fn flag_rows(flags: &StartDefaults) -> Vec<(&'static str, String, &'static str)> {
+    FlagField::ALL
+        .iter()
+        .filter(|field| **field != FlagField::RunnerId)
+        .filter_map(|field| {
+            let value = flag_value_display(flags, *field);
+            let label = match field {
+                FlagField::ExtraArgs => "",
+                _ => field.label(),
+            };
+            (!value.starts_with('(') && value != "off").then_some((field.name(), value, label))
+        })
+        .collect()
+}
+
+/// Flag lines in three aligned columns: name, value, `--flag`. Values are
+/// truncated from the start; the `--flag` column goes first when space is short.
+fn flag_lines(rows: &[(&'static str, String, &'static str)], area: Rect) -> Vec<Line<'static>> {
+    let width = usize::from(area.width);
+    let height = usize::from(area.height).max(1);
+    let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0) + 2;
+    let label_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0);
+    let value_w = rows
+        .iter()
+        .map(|r| Span::raw(r.1.as_str()).width())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let room = width.saturating_sub(name_w);
+    let (value_w, show_labels) = if value_w + label_w <= room {
+        (value_w, true)
+    } else {
+        (room, false)
+    };
+    let shown = if rows.len() > height {
+        height - 1
+    } else {
+        rows.len()
+    };
+    let mut out: Vec<Line<'static>> = rows[..shown]
+        .iter()
+        .map(|(name, value, label)| {
+            let value = truncate_start(value, value_w);
+            let pad = value_w.saturating_sub(Span::raw(&value).width());
+            let mut spans = vec![muted(format!("{name:<name_w$}")), Span::raw(value)];
+            if show_labels {
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(muted(*label));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    if shown < rows.len() {
+        out.push(Line::from(muted(format!("+{} more", rows.len() - shown))));
+    }
+    out
+}
+
+/// One column of breathing room inside a bordered block.
+fn padded(inner: Rect) -> Rect {
+    Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
+    }
 }
 
 /// Amp log line, with timestamps dimmed and thread URLs shortened to their ID.
@@ -484,7 +568,7 @@ fn footer_hints(app: &App) -> Vec<Hint> {
                 ("x", "stop", key('x')),
                 ("r", "restart", key('r')),
                 ("a", "add dir", key('a')),
-                ("f", "flags", key('f')),
+                ("f", "defaults", key('f')),
                 ("u", "update amp", key('u')),
                 ("L", "log", key('L')),
                 ("?", "help", key('?')),

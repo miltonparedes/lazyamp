@@ -104,6 +104,28 @@ impl StartDefaults {
     }
 }
 
+impl From<&StartOptions> for StartDefaults {
+    /// The flags a runner was started with, in the shape the flags panel shows.
+    fn from(opts: &StartOptions) -> Self {
+        Self {
+            runner_id: opts.runner_id.clone(),
+            mode: opts.mode.clone(),
+            log_level: opts.log_level.clone(),
+            settings_file: opts.settings_file.clone(),
+            mcp_config: opts.mcp_config.clone(),
+            visibility: opts.visibility.clone(),
+            features: opts.features.clone(),
+            remote_control_terminal: opts.remote_control_terminal,
+            discover_dirs: opts.discover_dirs,
+            amp_env: opts.amp_env,
+            desktop: opts.desktop,
+            share: opts.share,
+            share_network: opts.share_network,
+            extra_args: opts.extra_args.clone(),
+        }
+    }
+}
+
 fn nonempty(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
