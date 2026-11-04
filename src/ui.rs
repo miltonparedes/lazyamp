@@ -1378,7 +1378,6 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
             KeyCode::Char('j') | KeyCode::Down => self.flag_field = self.flag_field.next(),
             KeyCode::Char('k') | KeyCode::Up => self.flag_field = self.flag_field.prev(),
-            KeyCode::Char('s') => self.save_flags(),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_flag_field(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('h') | KeyCode::Left => {
                 self.nudge_flag()
@@ -1481,6 +1480,7 @@ impl App {
             FlagField::ShareNetwork => self.flags.share_network = !self.flags.share_network,
             _ => {}
         }
+        self.save_flags();
     }
 
     fn commit_edit(&mut self) {
@@ -1495,9 +1495,15 @@ impl App {
             }
             _ => {}
         }
+        self.save_flags();
     }
 
+    /// Every change in the flags panel is written immediately, so closing the
+    /// panel or quitting can never drop it.
     fn save_flags(&mut self) {
+        if self.flags == self.config.defaults {
+            return;
+        }
         if let Some(id) = self.flags.runner_id.as_deref() {
             if !is_plausible_runner_id(id) {
                 self.log(
@@ -1524,7 +1530,6 @@ impl App {
                     LogKind::Ok,
                     format!("saved defaults to {}", self.config_path.display()),
                 );
-                self.overlay = Overlay::None;
             }
             Err(err) => self.log(LogKind::Error, format!("save failed: {err:#}")),
         }
@@ -1713,6 +1718,7 @@ impl App {
             },
             ConfirmAction::EnableShare => {
                 self.flags.share = true;
+                self.save_flags();
                 self.overlay = Overlay::Flags;
             }
             ConfirmAction::QuitAfterUpdate(tag) => {
@@ -2276,6 +2282,25 @@ mod tests {
                 _ => panic!("wrong removal job"),
             }
         }
+    }
+
+    #[test]
+    fn flag_changes_persist_without_an_explicit_save() {
+        let (mut app, _, _) = test_app();
+        let tmp = tempfile::tempdir().unwrap();
+        app.config_path = tmp.path().join("config.toml");
+        app.config_writable = true;
+        app.pane = Pane::Runners;
+        press(&mut app, KeyCode::Char('f'));
+        while app.flag_field != FlagField::Desktop {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        let saved = Config::load_from(&app.config_path).unwrap().config;
+        assert!(saved.defaults.desktop);
+        assert!(app.start_options().desktop);
     }
 
     #[test]

@@ -510,8 +510,7 @@ fn footer_hints(app: &App) -> Vec<Hint> {
         Overlay::Flags => vec![
             ("↑↓", "move", None),
             ("⏎", "change", enter),
-            ("s", "save", key('s')),
-            ("esc", "cancel", esc),
+            ("esc", "close", esc),
         ],
         Overlay::EditField => vec![("⏎", "done", enter), ("esc", "cancel", esc)],
         Overlay::Confirm => vec![("y", "confirm", key('y')), ("n", "cancel", key('n'))],
