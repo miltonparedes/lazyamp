@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+TIMEFORMAT='  completed in %3R seconds'
+run() {
+  printf '\n==> %s\n' "$*"
+  time "$@"
+}
+
+printf '\n==> Checking system packages\n'
+missing=()
+for package in build-essential ca-certificates curl; do
+  if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+    missing+=("$package")
+  fi
+done
+if ((${#missing[@]})); then
+  as_root=()
+  if ((EUID != 0)); then
+    as_root=(sudo -n)
+  fi
+  run "${as_root[@]}" apt-get update
+  run "${as_root[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+if ! command -v rustup >/dev/null 2>&1; then
+  printf '\n==> Installing rustup\n'
+  time curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+fi
+
+# Match CI's stable channel, without downloading it again on a warm snapshot.
+if ! rustup run stable rustc --version; then
+  run rustup toolchain install stable --profile minimal --no-self-update
+fi
+run rustup component add --toolchain stable rustfmt clippy
+run rustup override set stable
+
+# Persist Cargo's PATH in the file Bash actually reads for login shells. Do not
+# create .bash_profile and accidentally hide an existing .profile/.bash_login.
+profile="$HOME/.profile"
+for candidate in "$HOME/.bash_profile" "$HOME/.bash_login"; do
+  if [[ -f "$candidate" ]]; then
+    profile="$candidate"
+    break
+  fi
+done
+# shellcheck disable=SC2016 # Expand these variables in each new login shell.
+path_line='export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"'
+if ! grep -Fqx "$path_line" "$profile" 2>/dev/null; then
+  printf '\n# lazyamp orb Rust toolchain\n%s\n' "$path_line" >> "$profile"
+fi
+
+# Keep both the crate cache and build artifacts in the project snapshot. Cargo
+# handles stale sources/lockfiles itself; no custom cache fingerprints are needed.
+run cargo fetch --locked
+run cargo build --locked --all-targets
+printf '\n==> Setup ready in %s seconds\n' "$SECONDS"
