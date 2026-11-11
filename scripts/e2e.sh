@@ -83,12 +83,13 @@ if [[ $mode == fake ]]; then
 	cp target/debug/examples/fake_amp "$tmp/bin/amp"
 	amp="$tmp/bin/amp"
 	# The fake accepts anything, so cover every flag lazyamp models plus unknown ones.
-	flags=(--share --desktop --amp-env --share-network --features fast,pro -m high
+	flags=(--share --desktop --amp-env --share-network --remote-control-portals --no-serve-cwd
+		--discover-depth 3 --discover-exclude dotfiles --create-dirs-in "$tmp/new" --features fast,pro -m high
 		--log-file "$tmp/amp.log" --discover-dirs "$tmp/src" --future-flag)
 else
 	amp=$(command -v amp) || fail "amp is not on PATH"
 	# No --share / --share-network: they expose this machine to the workspace.
-	flags=(--desktop --amp-env --log-file "$tmp/amp.log")
+	flags=(--desktop --amp-env --remote-control-portals --create-dirs-in "$tmp/new" --log-file "$tmp/amp.log")
 fi
 flags+=(--dir "$tmp/extra")
 

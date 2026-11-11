@@ -25,14 +25,30 @@ pub struct StartOptions {
     /// Comma-separated thread features (`fast`, `plaid`, `pro`).
     pub features: Option<String>,
     pub remote_control_terminal: bool,
+    pub remote_control_portals: bool,
     pub extra_dirs: Vec<PathBuf>,
     pub discover_dirs: bool,
+    /// Scan depth for discovery (1 to 10); implies `--discover-dirs`.
+    pub discover_depth: Option<String>,
+    /// `.gitignore`-style patterns to skip; each implies `--discover-dirs`.
+    pub discover_exclude: Vec<String>,
+    pub no_serve_cwd: bool,
+    /// Where directories and projects created from the web go.
+    pub create_dirs_in: Option<String>,
     pub amp_env: bool,
     pub desktop: bool,
     pub share: bool,
     pub share_network: bool,
     /// Passed to Amp verbatim, for flags lazyamp does not model.
     pub extra_args: Vec<String>,
+}
+
+impl StartOptions {
+    /// Whether the runner scans for checkouts: `--discover-depth` and
+    /// `--discover-exclude` each imply `--discover-dirs`.
+    pub fn discovers(&self) -> bool {
+        self.discover_dirs || self.discover_depth.is_some() || !self.discover_exclude.is_empty()
+    }
 }
 
 /// Persisted argv + cwd used to start a specific runner.
@@ -390,12 +406,27 @@ pub fn start_runner_args(opts: &StartOptions) -> Vec<String> {
     push_opt(&mut args, "--mcp-config", opts.mcp_config.as_deref());
     push_opt(&mut args, "--visibility", opts.visibility.as_deref());
     push_opt(&mut args, "--features", opts.features.as_deref());
+    push_opt(
+        &mut args,
+        "--discover-depth",
+        opts.discover_depth.as_deref(),
+    );
+    for pattern in &opts.discover_exclude {
+        push_opt(&mut args, "--discover-exclude", Some(pattern));
+    }
+    push_opt(
+        &mut args,
+        "--create-dirs-in",
+        opts.create_dirs_in.as_deref(),
+    );
     for (on, flag) in [
         (opts.remote_control_terminal, "--remote-control-terminal"),
+        (opts.remote_control_portals, "--remote-control-portals"),
         (opts.amp_env, "--amp-env"),
         (opts.desktop, "--desktop"),
         (opts.share, "--share"),
         (opts.share_network, "--share-network"),
+        (opts.no_serve_cwd, "--no-serve-cwd"),
     ] {
         if on {
             args.push(flag.into());
@@ -432,6 +463,8 @@ pub fn start_options_from_cmdline(args: &[String]) -> StartOptions {
             "--mcp-config" => Some(&mut opts.mcp_config),
             "--visibility" => Some(&mut opts.visibility),
             "--features" => Some(&mut opts.features),
+            "--discover-depth" => Some(&mut opts.discover_depth),
+            "--create-dirs-in" => Some(&mut opts.create_dirs_in),
             _ => None,
         };
         if let Some(slot) = slot {
@@ -442,10 +475,12 @@ pub fn start_options_from_cmdline(args: &[String]) -> StartOptions {
         }
         let toggle = match (name, inline.is_some()) {
             ("--remote-control-terminal", false) => Some(&mut opts.remote_control_terminal),
+            ("--remote-control-portals", false) => Some(&mut opts.remote_control_portals),
             ("--amp-env", false) => Some(&mut opts.amp_env),
             ("--desktop", false) => Some(&mut opts.desktop),
             ("--share", false) => Some(&mut opts.share),
             ("--share-network", false) => Some(&mut opts.share_network),
+            ("--no-serve-cwd", false) => Some(&mut opts.no_serve_cwd),
             _ => None,
         };
         if let Some(toggle) = toggle {
@@ -457,6 +492,11 @@ pub fn start_options_from_cmdline(args: &[String]) -> StartOptions {
             "--dir" => {
                 if let Some(dir) = inline.or_else(|| iter.next().cloned()) {
                     opts.extra_dirs.push(PathBuf::from(dir));
+                }
+            }
+            "--discover-exclude" => {
+                if let Some(pattern) = inline.or_else(|| iter.next().cloned()) {
+                    opts.discover_exclude.push(pattern);
                 }
             }
             // A bare `--discover-dirs` scans the cwd; with a path it is kept verbatim.
@@ -2029,7 +2069,7 @@ pub fn removal_restart_spec(
     if resolved_dir(&spec.cwd, &cwd) != cwd {
         bail!("saved launch cwd differs from the running runner; restart manually");
     }
-    if spec.options.discover_dirs {
+    if spec.options.discovers() {
         bail!("changing primary directory with --discover-dirs requires a manual restart");
     }
     let id = runner
@@ -2249,6 +2289,15 @@ mod tests {
             "claude-code",
             "--share",
             "--desktop",
+            "--remote-control-portals",
+            "--no-serve-cwd",
+            "--discover-depth",
+            "3",
+            "--discover-exclude",
+            "dotfiles",
+            "--discover-exclude=work/legacy",
+            "--create-dirs-in",
+            "/new",
             "--features",
             "fast,pro",
             "--amp-env",
@@ -2266,7 +2315,11 @@ mod tests {
         assert_eq!(opts.runner_id.as_deref(), Some("mac-builder"));
         assert_eq!(opts.mode.as_deref(), Some("claude-code"));
         assert_eq!(opts.features.as_deref(), Some("fast,pro"));
-        assert!(opts.share && opts.desktop && opts.amp_env);
+        assert!(opts.share && opts.desktop && opts.amp_env && opts.remote_control_portals);
+        assert!(opts.no_serve_cwd);
+        assert_eq!(opts.discover_depth.as_deref(), Some("3"));
+        assert_eq!(opts.discover_exclude, ["dotfiles", "work/legacy"]);
+        assert_eq!(opts.create_dirs_in.as_deref(), Some("/new"));
         assert!(!opts.share_network && !opts.discover_dirs);
         assert_eq!(opts.extra_dirs, vec![PathBuf::from("/work/a")]);
         assert_eq!(
@@ -2817,6 +2870,10 @@ mac-mini (pid 4321)
         let mut discovery = saved.clone();
         discovery.options.discover_dirs = true;
         assert!(removal_restart_spec(&runner, &cwd, Some(discovery)).is_err());
+        // --discover-depth alone scans the cwd too, so moving it is just as unsafe.
+        let mut depth = saved.clone();
+        depth.options.discover_depth = Some("3".into());
+        assert!(removal_restart_spec(&runner, &cwd, Some(depth)).is_err());
         runner.dirs = vec![cwd.clone(), tmp.path().join("missing")];
         assert!(removal_restart_spec(&runner, &cwd, Some(saved.clone()))
             .unwrap_err()

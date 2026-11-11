@@ -8,7 +8,8 @@ use crate::amp::{
     AmpClient, LaunchSpec, Runner, StartHealth, StartOptions, StopOutcome,
 };
 use crate::config::{
-    config_path, cycle_choice, Config, StartDefaults, LOG_LEVELS, MODES, VISIBILITIES,
+    config_path, cycle_choice, Config, StartDefaults, DISCOVER_DEPTHS, LOG_LEVELS, MODES,
+    VISIBILITIES,
 };
 use crate::dirpick::{
     collect_ranked_paths, query_zoxide_dirs, walk_matching_dirs, PathSource, RankedPath,
@@ -199,7 +200,12 @@ enum FlagField {
     SettingsFile,
     McpConfig,
     RemoteControl,
+    RemotePortals,
     DiscoverDirs,
+    DiscoverDepth,
+    DiscoverExclude,
+    NoServeCwd,
+    CreateDirsIn,
     AmpEnv,
     Desktop,
     Share,
@@ -208,7 +214,7 @@ enum FlagField {
 }
 
 impl FlagField {
-    const ALL: [FlagField; 14] = [
+    const ALL: [FlagField; 19] = [
         FlagField::RunnerId,
         FlagField::Mode,
         FlagField::LogLevel,
@@ -217,7 +223,12 @@ impl FlagField {
         FlagField::SettingsFile,
         FlagField::McpConfig,
         FlagField::RemoteControl,
+        FlagField::RemotePortals,
         FlagField::DiscoverDirs,
+        FlagField::DiscoverDepth,
+        FlagField::DiscoverExclude,
+        FlagField::NoServeCwd,
+        FlagField::CreateDirsIn,
         FlagField::AmpEnv,
         FlagField::Desktop,
         FlagField::Share,
@@ -242,6 +253,8 @@ impl FlagField {
                 | FlagField::Features
                 | FlagField::SettingsFile
                 | FlagField::McpConfig
+                | FlagField::DiscoverExclude
+                | FlagField::CreateDirsIn
                 | FlagField::ExtraArgs
         )
     }
@@ -255,7 +268,12 @@ impl FlagField {
             FlagField::SettingsFile => "Settings file",
             FlagField::McpConfig => "MCP config",
             FlagField::RemoteControl => "Remote control terminal",
+            FlagField::RemotePortals => "Remote control portals",
             FlagField::DiscoverDirs => "Discover directories",
+            FlagField::DiscoverDepth => "Discover depth",
+            FlagField::DiscoverExclude => "Discover exclude",
+            FlagField::NoServeCwd => "Don't serve cwd",
+            FlagField::CreateDirsIn => "Create dirs in",
             FlagField::AmpEnv => "Use Amp env",
             FlagField::Features => "Thread features",
             FlagField::Desktop => "Share desktop",
@@ -274,7 +292,12 @@ impl FlagField {
             FlagField::SettingsFile => "--settings-file",
             FlagField::McpConfig => "--mcp-config",
             FlagField::RemoteControl => "--remote-control-terminal",
+            FlagField::RemotePortals => "--remote-control-portals",
             FlagField::DiscoverDirs => "--discover-dirs",
+            FlagField::DiscoverDepth => "--discover-depth",
+            FlagField::DiscoverExclude => "--discover-exclude",
+            FlagField::NoServeCwd => "--no-serve-cwd",
+            FlagField::CreateDirsIn => "--create-dirs-in",
             FlagField::AmpEnv => "--amp-env",
             FlagField::Features => "--features",
             FlagField::Desktop => "--desktop",
@@ -1472,7 +1495,15 @@ impl App {
             FlagField::RemoteControl => {
                 self.flags.remote_control_terminal = !self.flags.remote_control_terminal;
             }
+            FlagField::RemotePortals => {
+                self.flags.remote_control_portals = !self.flags.remote_control_portals;
+            }
             FlagField::DiscoverDirs => self.flags.discover_dirs = !self.flags.discover_dirs,
+            FlagField::DiscoverDepth => {
+                self.flags.discover_depth =
+                    cycle_choice(self.flags.discover_depth.as_deref(), DISCOVER_DEPTHS);
+            }
+            FlagField::NoServeCwd => self.flags.no_serve_cwd = !self.flags.no_serve_cwd,
             FlagField::AmpEnv => self.flags.amp_env = !self.flags.amp_env,
             FlagField::Desktop => self.flags.desktop = !self.flags.desktop,
             FlagField::Share if !self.flags.share => self.ask_confirm(ConfirmAction::EnableShare),
@@ -1490,6 +1521,14 @@ impl App {
             FlagField::SettingsFile => self.flags.settings_file = value,
             FlagField::McpConfig => self.flags.mcp_config = value,
             FlagField::Features => self.flags.features = value,
+            // No shell runs Amp, so `~` has to be expanded here.
+            FlagField::CreateDirsIn => {
+                self.flags.create_dirs_in = value.map(|v| expand_path(&v).display().to_string())
+            }
+            FlagField::DiscoverExclude => {
+                self.flags.discover_exclude =
+                    self.edit.text.split_whitespace().map(Into::into).collect()
+            }
             FlagField::ExtraArgs => {
                 self.flags.extra_args = self.edit.text.split_whitespace().map(Into::into).collect()
             }
@@ -1625,6 +1664,14 @@ impl App {
             }
         }
         let opts = self.start_options();
+        // Such a runner serves no directory, so it never registers with Amp.
+        if opts.no_serve_cwd && !opts.discovers() && opts.extra_dirs.is_empty() {
+            self.log(
+                LogKind::Error,
+                "refusing to start: --no-serve-cwd needs --discover-dirs, or the runner serves nothing",
+            );
+            return;
+        }
         self.submit(
             AmpJob::Start {
                 cwd: cwd.to_path_buf(),
@@ -2071,6 +2118,8 @@ fn flag_text(flags: &StartDefaults, field: FlagField) -> Option<String> {
         FlagField::SettingsFile => flags.settings_file.clone(),
         FlagField::McpConfig => flags.mcp_config.clone(),
         FlagField::Features => flags.features.clone(),
+        FlagField::CreateDirsIn => flags.create_dirs_in.clone(),
+        FlagField::DiscoverExclude => Some(flags.discover_exclude.join(" ")),
         FlagField::ExtraArgs => Some(flags.extra_args.join(" ")),
         _ => None,
     }
@@ -2094,7 +2143,19 @@ fn flag_value_display(flags: &StartDefaults, field: FlagField) -> String {
             .unwrap_or_else(|| "(none)".into()),
         FlagField::McpConfig => flags.mcp_config.clone().unwrap_or_else(|| "(none)".into()),
         FlagField::RemoteControl => on_off(flags.remote_control_terminal),
+        FlagField::RemotePortals => on_off(flags.remote_control_portals),
         FlagField::DiscoverDirs => on_off(flags.discover_dirs),
+        FlagField::DiscoverDepth => flags
+            .discover_depth
+            .clone()
+            .unwrap_or_else(|| "(amp default)".into()),
+        FlagField::DiscoverExclude if flags.discover_exclude.is_empty() => "(none)".into(),
+        FlagField::DiscoverExclude => flags.discover_exclude.join(" "),
+        FlagField::NoServeCwd => on_off(flags.no_serve_cwd),
+        FlagField::CreateDirsIn => flags
+            .create_dirs_in
+            .clone()
+            .unwrap_or_else(|| "(none)".into()),
         FlagField::AmpEnv => on_off(flags.amp_env),
         FlagField::Desktop => on_off(flags.desktop),
         FlagField::Share => on_off(flags.share),
