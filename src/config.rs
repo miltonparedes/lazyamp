@@ -67,7 +67,19 @@ pub struct StartDefaults {
     #[serde(default)]
     pub remote_control_terminal: bool,
     #[serde(default)]
+    pub remote_control_portals: bool,
+    #[serde(default)]
     pub discover_dirs: bool,
+    /// `1` to `10`; implies `discover_dirs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover_depth: Option<String>,
+    /// `.gitignore`-style patterns; each implies `discover_dirs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discover_exclude: Vec<String>,
+    #[serde(default)]
+    pub no_serve_cwd: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_dirs_in: Option<String>,
     #[serde(default)]
     pub amp_env: bool,
     #[serde(default)]
@@ -93,8 +105,13 @@ impl StartDefaults {
             visibility: nonempty(self.visibility.as_deref()),
             features: nonempty(self.features.as_deref()),
             remote_control_terminal: self.remote_control_terminal,
+            remote_control_portals: self.remote_control_portals,
             extra_dirs: Vec::new(),
             discover_dirs: self.discover_dirs,
+            discover_depth: nonempty(self.discover_depth.as_deref()),
+            discover_exclude: self.discover_exclude.clone(),
+            no_serve_cwd: self.no_serve_cwd,
+            create_dirs_in: nonempty(self.create_dirs_in.as_deref()),
             amp_env: self.amp_env,
             desktop: self.desktop,
             share: self.share,
@@ -116,7 +133,12 @@ impl From<&StartOptions> for StartDefaults {
             visibility: opts.visibility.clone(),
             features: opts.features.clone(),
             remote_control_terminal: opts.remote_control_terminal,
+            remote_control_portals: opts.remote_control_portals,
             discover_dirs: opts.discover_dirs,
+            discover_depth: opts.discover_depth.clone(),
+            discover_exclude: opts.discover_exclude.clone(),
+            no_serve_cwd: opts.no_serve_cwd,
+            create_dirs_in: opts.create_dirs_in.clone(),
             amp_env: opts.amp_env,
             desktop: opts.desktop,
             share: opts.share,
@@ -246,6 +268,8 @@ impl Config {
         self.defaults.settings_file = nonempty(self.defaults.settings_file.as_deref());
         self.defaults.mcp_config = nonempty(self.defaults.mcp_config.as_deref());
         self.defaults.visibility = nonempty(self.defaults.visibility.as_deref());
+        self.defaults.discover_depth = nonempty(self.defaults.discover_depth.as_deref());
+        self.defaults.create_dirs_in = nonempty(self.defaults.create_dirs_in.as_deref());
         self.recent_dirs.retain(|p| !p.trim().is_empty());
         self.recent_dirs.truncate(MAX_RECENT_DIRS);
         self
@@ -299,6 +323,8 @@ pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
 pub const MODES: &[&str] = &["low", "medium", "high", "ultra"];
 pub const LOG_LEVELS: &[&str] = &["debug", "info", "warn", "error", "audit"];
 pub const VISIBILITIES: &[&str] = &["private", "unlisted", "workspace", "group"];
+/// `--discover-depth` accepts 1 to 10; Amp scans 2 levels without it.
+pub const DISCOVER_DEPTHS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
 
 #[cfg(test)]
 mod tests {
