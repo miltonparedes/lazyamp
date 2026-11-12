@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end check: a runner started outside lazyamp keeps every flag and its
-# working directory when lazyamp restarts it (`r`, then `y`).
+# working directory when lazyamp restarts it (`r`, then `y`), and flags changed
+# on the running runner (`f`) are the ones its next restart starts with.
 #
 #   scripts/e2e.sh          # against examples/fake_amp.rs (no login, no network)
 #   scripts/e2e.sh --real   # against the `amp` on PATH (needs a logged-in Amp)
@@ -108,16 +109,19 @@ tmux new-session -d -s "$session" -x 120 -y 36 \
 	"AMP_BIN='$amp' XDG_CONFIG_HOME='$tmp/config' XDG_STATE_HOME='$tmp/state' '$repo/target/debug/lazyamp'"
 on_screen() { tmux capture-pane -p -t "$session" | grep -q "$1"; }
 wait_for 30 "$id in lazyamp" on_screen "$id"
-tmux send-keys -t "$session" r
-wait_for 5 "restart confirmation" on_screen "Restart runner"
-tmux send-keys -t "$session" y
+restart() { # press r, confirm, and wait for a new process: sets old_pid and new_pid
+	tmux send-keys -t "$session" r
+	wait_for 5 "restart confirmation" on_screen "Restart runner"
+	tmux send-keys -t "$session" y
+	wait_for 90 "a new runner process to replace pid $old_pid" restarted
+	wait_for 60 "$id listed again" listed
+	echo "pid $old_pid -> $new_pid"
+}
 restarted() {
 	new_pid=$(runner_pids | grep -vx "$old_pid" | head -1)
 	[[ -n $new_pid ]] && ! kill -0 "$old_pid" 2>/dev/null
 }
-wait_for 90 "a new runner process to replace pid $old_pid" restarted
-wait_for 60 "$id listed again" listed
-echo "pid $old_pid -> $new_pid"
+restart
 
 say "comparing flags"
 diff -u <(normalized_flags "$tmp/old.cmdline") <(normalized_flags "/proc/$new_pid/cmdline") ||
@@ -126,5 +130,27 @@ normalized_flags "/proc/$new_pid/cmdline" | sed 's/^/  /'
 new_cwd=$(readlink "/proc/$new_pid/cwd")
 [[ $new_cwd == "$tmp/work" ]] || fail "cwd changed: $tmp/work -> $new_cwd"
 echo "  cwd $new_cwd"
+
+say "changing the running runner's flags: --remote-control-terminal on, --desktop off"
+tmux send-keys -t "$session" f
+wait_for 5 "the runner's flags panel" on_screen "Flags for $id"
+tmux send-keys -t "$session" j j j j j j Enter # Mode -> Remote control terminal
+tmux send-keys -t "$session" j j j j j j j j Enter # -> Share desktop
+tmux send-keys -t "$session" Escape
+wait_for 5 "the offer to restart with the new flags" on_screen "its new flags"
+tmux send-keys -t "$session" n
+wait_for 5 "the pending flags on the runner" on_screen "restart to apply"
+[[ $(runner_pids) == "$new_pid" ]] || fail "changing flags must not restart the runner by itself"
+old_pid=$new_pid
+restart
+
+say "comparing flags"
+diff -u <({
+	normalized_flags "$tmp/old.cmdline" | grep -vx -- --desktop
+	echo --remote-control-terminal
+} | LC_ALL=C sort) <(normalized_flags "/proc/$new_pid/cmdline" | LC_ALL=C sort) ||
+	fail "restart did not apply exactly the changed flags (- expected, + after)"
+normalized_flags "/proc/$new_pid/cmdline" | sed 's/^/  /'
+wait_for 10 "the pending mark to clear" bash -c "! tmux capture-pane -p -t '$session' | grep -q 'restart to apply'"
 
 say "PASS"

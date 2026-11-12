@@ -57,6 +57,10 @@ pub struct LaunchSpec {
     pub runner_id: Option<String>,
     pub cwd: PathBuf,
     pub options: StartOptions,
+    /// The flags were changed in lazyamp after the runner started, so its next
+    /// restart uses them instead of the flags the process runs with.
+    #[serde(default)]
+    pub edited: bool,
 }
 
 /// Result of spawning `amp --no-tui` after a short liveness probe.
@@ -105,6 +109,9 @@ pub struct Runner {
     pub threads: Option<u32>,
     /// Flags the local process runs with; `None` when it is not running here.
     pub launch: Option<StartOptions>,
+    /// Flags changed in lazyamp that the next restart applies; `None` when the
+    /// process already runs with them.
+    pub pending: Option<StartOptions>,
 }
 
 impl Runner {
@@ -257,10 +264,11 @@ impl AmpClient {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
-        persist_launch_spec(&LaunchSpec {
+        let _ = persist_launch_spec(&LaunchSpec {
             runner_id: opts.runner_id.clone(),
             cwd: cwd.to_path_buf(),
             options: opts.clone(),
+            edited: false,
         });
         record_spawn(pid, opts, cwd, &log_path);
         let health = probe_start_health(self, pid, opts.runner_id.as_deref(), &log_path);
@@ -1801,6 +1809,7 @@ impl SpawnRecord {
             runner_id: options.runner_id.clone().or_else(|| self.runner_id.clone()),
             cwd: PathBuf::from(&self.cwd),
             options,
+            edited: false,
         })
     }
 }
@@ -1868,6 +1877,7 @@ fn live_spawn_records() -> Vec<(SpawnRecord, LocalProcess)> {
 /// (log file, thread count, outdated binary). Cheap: no Amp subprocess.
 pub fn merge_with_local(listed: Vec<Runner>) -> Vec<Runner> {
     let records = live_spawn_records();
+    let launches = load_launches();
     let spawned: Vec<LocalProcess> = records.iter().map(|(_, proc)| proc.clone()).collect();
     let local = scan_local_amp_processes();
     let mut runners = merge_runners(listed, &local, &spawned);
@@ -1884,6 +1894,8 @@ pub fn merge_with_local(listed: Vec<Runner>) -> Vec<Runner> {
                     .find(|p| p.pid == pid)
                     .map(|p| start_options_from_cmdline(&p.args))
             });
+        runner.pending = saved_spec_in(runner, &records, &launches)
+            .and_then(|spec| pending_flags(&spec, runner.launch.as_ref()));
         runner.log_path = process_stdout_file(pid).or_else(|| {
             records
                 .iter()
@@ -1964,31 +1976,60 @@ fn same_launch_key(a: &LaunchSpec, b: &LaunchSpec) -> bool {
     }
 }
 
-/// Remember the argv/cwd used to start a runner (survives stop for restart).
-pub fn persist_launch_spec(spec: &LaunchSpec) {
-    let Ok(mut specs) = read_state::<LaunchSpec>(&launches_path()) else {
-        return;
-    };
+/// Remember the argv/cwd a runner restarts with, replacing its earlier spec.
+pub fn persist_launch_spec(spec: &LaunchSpec) -> Result<()> {
+    let path = launches_path();
+    let mut specs = read_state::<LaunchSpec>(&path)?;
     specs.retain(|s| !same_launch_key(s, spec));
     specs.push(spec.clone());
-    if let Ok(raw) = serde_json::to_string_pretty(&specs) {
-        let _ = atomic_write(&launches_path(), raw);
-    }
+    atomic_write(&path, serde_json::to_string_pretty(&specs)?)
 }
 
 /// Launch spec for this runner: the exact spawn record for its PID first (the
 /// process lazyamp actually started), then saved specs by runner-id / cwd.
+/// Flags edited in lazyamp since the process started replace either.
 pub fn saved_launch_spec(runner: &Runner) -> Option<LaunchSpec> {
-    runner
-        .pid
-        .and_then(|pid| live_spawn_records().into_iter().find(|(r, _)| r.pid == pid))
+    saved_spec_in(runner, &live_spawn_records(), &load_launches())
+}
+
+fn saved_spec_in(
+    runner: &Runner,
+    records: &[(SpawnRecord, LocalProcess)],
+    launches: &[LaunchSpec],
+) -> Option<LaunchSpec> {
+    let spec = records
+        .iter()
+        .find(|(r, _)| Some(r.pid) == runner.pid)
         .and_then(|(r, _)| r.launch_spec())
-        .or_else(|| find_launch_spec(runner.runner_id_flag(), runner.cwd.as_deref()))
+        .or_else(|| find_launch_spec(launches, runner.runner_id_flag(), runner.cwd.as_deref()))?;
+    let edited = launches
+        .iter()
+        .find(|s| s.edited && same_launch_key(s, &spec));
+    Some(edited.cloned().unwrap_or(spec))
+}
+
+/// The flags `spec` restarts with, when they were edited in lazyamp and differ
+/// from the ones the process runs with.
+pub fn pending_flags(spec: &LaunchSpec, running: Option<&StartOptions>) -> Option<StartOptions> {
+    if !spec.edited {
+        return None;
+    }
+    let next = restart_start_options(spec);
+    // A runner started without `--runner-id` restarts with the ID Amp gave it.
+    let unchanged = running.is_some_and(|running| {
+        let mut running = running.clone();
+        running.runner_id = next.runner_id.clone();
+        running == next
+    });
+    (!unchanged).then_some(next)
 }
 
 /// Look up a saved launch spec by runner-id, then uniquely by cwd (no id).
-pub fn find_launch_spec(runner_id: Option<&str>, cwd: Option<&Path>) -> Option<LaunchSpec> {
-    let specs = load_launches();
+fn find_launch_spec(
+    specs: &[LaunchSpec],
+    runner_id: Option<&str>,
+    cwd: Option<&Path>,
+) -> Option<LaunchSpec> {
     if let Some(id) = runner_id.filter(|s| !s.is_empty()) {
         if let Some(spec) = specs.iter().find(|s| {
             s.runner_id
@@ -2135,6 +2176,7 @@ pub fn launch_spec_for_restart(runner: &Runner) -> Result<LaunchSpec> {
                 runner_id: opts.runner_id.clone(),
                 cwd,
                 options: opts,
+                edited: false,
             };
             validate_launch_spec(&spec)?;
             return Ok(spec);
@@ -2152,6 +2194,7 @@ pub fn launch_spec_for_restart(runner: &Runner) -> Result<LaunchSpec> {
             runner_id: runner.runner_id_flag().map(str::to_string),
             ..StartOptions::default()
         },
+        edited: false,
     };
     validate_launch_spec(&spec)?;
     Ok(spec)
@@ -2768,6 +2811,7 @@ mac-mini (pid 4321)
                 discover_dirs: true,
                 ..StartOptions::default()
             },
+            edited: false,
         };
         let opts = restart_start_options(&spec);
         assert_eq!(
@@ -2785,6 +2829,76 @@ mac-mini (pid 4321)
         );
         assert_ne!(opts.mode.as_deref(), Some("low"));
         assert_ne!(opts.runner_id.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn flags_edited_for_a_running_runner_replace_its_spawn_flags_on_restart() {
+        let started = StartOptions {
+            runner_id: Some("alpha".into()),
+            mode: Some("high".into()),
+            extra_dirs: vec![PathBuf::from("/extra")],
+            ..StartOptions::default()
+        };
+        let record = SpawnRecord {
+            pid: 7,
+            runner_id: Some("alpha".into()),
+            cwd: "/work".into(),
+            options: Some(started.clone()),
+            log_path: None,
+        };
+        let records = [(
+            record.clone(),
+            local_proc(7, Some("alpha"), Some("/work"), None),
+        )];
+        let runner = listed_runner("alpha", Some(7), Some("/work"));
+        let spawn_spec = record.launch_spec().unwrap();
+        let other = LaunchSpec {
+            runner_id: Some("beta".into()),
+            edited: true,
+            ..spawn_spec.clone()
+        };
+
+        // What every start writes: not an edit, so the spawn record stands.
+        let stale = LaunchSpec {
+            options: StartOptions::default(),
+            ..spawn_spec.clone()
+        };
+        let saved = saved_spec_in(&runner, &records, &[other.clone(), stale]).unwrap();
+        assert_eq!(saved, spawn_spec);
+        assert_eq!(pending_flags(&saved, Some(&started)), None);
+
+        let edited = LaunchSpec {
+            options: StartOptions {
+                desktop: true,
+                ..started.clone()
+            },
+            edited: true,
+            ..spawn_spec.clone()
+        };
+        let saved = saved_spec_in(&runner, &records, &[other.clone(), edited.clone()]).unwrap();
+        assert_eq!(saved, edited);
+        let pending = pending_flags(&saved, Some(&started)).unwrap();
+        assert_eq!(
+            start_runner_args(&pending),
+            [
+                "--no-tui",
+                "--runner-id",
+                "alpha",
+                "--mode",
+                "high",
+                "--desktop",
+                "--dir",
+                "/extra"
+            ]
+        );
+
+        // Changing a flag back leaves nothing to apply.
+        let reverted = LaunchSpec {
+            edited: true,
+            ..spawn_spec
+        };
+        let saved = saved_spec_in(&runner, &records, &[other, reverted]).unwrap();
+        assert_eq!(pending_flags(&saved, Some(&started)), None);
     }
 
     fn removal_fixture(root: &Path) -> (Runner, LaunchSpec) {
@@ -2810,6 +2924,7 @@ mac-mini (pid 4321)
                 extra_dirs: vec![PathBuf::from("project"), PathBuf::from("../extra")],
                 ..StartOptions::default()
             },
+            edited: false,
         };
         (runner, spec)
     }

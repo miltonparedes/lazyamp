@@ -4,8 +4,9 @@ mod view;
 
 use crate::amp::{
     is_plausible_runner_id, launch_spec_for_restart, local_amp_pids, merge_with_local,
-    removal_restart_spec, restart_start_options, saved_launch_spec, stop_verified, tail_log_lines,
-    AmpClient, LaunchSpec, Runner, StartHealth, StartOptions, StopOutcome,
+    pending_flags, persist_launch_spec, removal_restart_spec, restart_start_options,
+    saved_launch_spec, stop_verified, tail_log_lines, AmpClient, LaunchSpec, Runner, StartHealth,
+    StartOptions, StopOutcome,
 };
 use crate::config::{
     config_path, cycle_choice, Config, StartDefaults, DISCOVER_DEPTHS, LOG_LEVELS, MODES,
@@ -308,6 +309,16 @@ impl FlagField {
     }
 }
 
+/// The running runner whose flags the panel edits.
+#[derive(Debug, Clone)]
+struct FlagTarget {
+    runner: Runner,
+    /// What its next restart starts with, including the edits made so far.
+    spec: LaunchSpec,
+    /// Changed since the panel opened.
+    dirty: bool,
+}
+
 #[derive(Debug, Clone)]
 struct PickerEntry {
     /// Where the match came from (`recent`, `zoxide`, …).
@@ -456,6 +467,8 @@ struct App {
     confirm: Option<ConfirmAction>,
     picker: Option<DirPicker>,
     flags: StartDefaults,
+    /// `None` while the panel edits the defaults for new runners.
+    flag_target: Option<FlagTarget>,
     flag_field: FlagField,
     edit: TextInput,
     log: VecDeque<LogLine>,
@@ -848,6 +861,7 @@ impl App {
             confirm: None,
             picker: None,
             flags,
+            flag_target: None,
             flag_field: FlagField::RunnerId,
             edit: TextInput::default(),
             log: VecDeque::new(),
@@ -1291,7 +1305,7 @@ impl App {
                         self.flag_field = field;
                     }
                 } else if outside_popup {
-                    self.overlay = Overlay::None;
+                    self.close_flags();
                 }
             }
             Overlay::Confirm if outside_popup => {
@@ -1378,11 +1392,11 @@ impl App {
             KeyCode::Char('d') => self.ask_remove_dir(),
             KeyCode::Char('u') => self.submit(AmpJob::Update, "updating amp"),
             KeyCode::Char('U') => self.ask_confirm(ConfirmAction::SelfUpdate),
-            KeyCode::Char('f') => {
-                self.flags = self.config.defaults.clone();
-                self.flag_field = FlagField::RunnerId;
-                self.overlay = Overlay::Flags;
-            }
+            KeyCode::Char('f') => match self.current_runner().cloned() {
+                Some(runner) => self.open_runner_flags(runner),
+                None => self.open_default_flags(),
+            },
+            KeyCode::Char('F') => self.open_default_flags(),
             KeyCode::Char('c') => {
                 let text = format!("config: {}", self.config_path.display());
                 self.log(LogKind::Info, text);
@@ -1398,7 +1412,7 @@ impl App {
 
     fn handle_flags_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
+            KeyCode::Esc | KeyCode::Char('q') => self.close_flags(),
             KeyCode::Char('j') | KeyCode::Down => self.flag_field = self.flag_field.next(),
             KeyCode::Char('k') | KeyCode::Up => self.flag_field = self.flag_field.prev(),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_flag_field(),
@@ -1471,7 +1485,70 @@ impl App {
         }
     }
 
+    fn open_default_flags(&mut self) {
+        self.flags = self.config.defaults.clone();
+        self.flag_target = None;
+        self.flag_field = FlagField::RunnerId;
+        self.overlay = Overlay::Flags;
+    }
+
+    /// Edit the flags of a running runner, starting from what its next restart
+    /// would use. Each change is saved; the restart applies them.
+    fn open_runner_flags(&mut self, runner: Runner) {
+        if runner.launch.is_none() {
+            self.log(
+                LogKind::Error,
+                format!(
+                    "{} is not running on this machine; its flags can only be changed where it runs",
+                    runner.display_id()
+                ),
+            );
+            return;
+        }
+        let spec = match launch_spec_for_restart(&runner) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.log(LogKind::Error, format!("cannot change flags: {err:#}"));
+                return;
+            }
+        };
+        self.flags = StartDefaults::from(&restart_start_options(&spec));
+        self.flag_target = Some(FlagTarget {
+            runner,
+            spec,
+            dirty: false,
+        });
+        self.flag_field = FlagField::Mode;
+        self.overlay = Overlay::Flags;
+    }
+
+    /// Closing the panel after changing a runner's flags offers the restart
+    /// that applies them.
+    fn close_flags(&mut self) {
+        self.overlay = Overlay::None;
+        let Some(target) = self.flag_target.take() else {
+            return;
+        };
+        let pending = pending_flags(&target.spec, target.runner.launch.as_ref());
+        if let Some(shown) = self.runners.iter_mut().find(|r| r.pid == target.runner.pid) {
+            shown.pending = pending.clone();
+        }
+        if target.dirty && pending.is_some() {
+            self.ask_confirm(ConfirmAction::Restart(Runner {
+                pending,
+                ..target.runner
+            }));
+        }
+    }
+
     fn activate_flag_field(&mut self) {
+        if self.flag_field == FlagField::RunnerId && self.flag_target.is_some() {
+            self.log(
+                LogKind::Error,
+                "a running runner keeps its ID; stop it and start a new one to change it",
+            );
+            return;
+        }
         if self.flag_field.is_text() {
             self.edit = TextInput::new(flag_text(&self.flags, self.flag_field).unwrap_or_default());
             self.overlay = Overlay::EditField;
@@ -1540,6 +1617,10 @@ impl App {
     /// Every change in the flags panel is written immediately, so closing the
     /// panel or quitting can never drop it.
     fn save_flags(&mut self) {
+        if self.flag_target.is_some() {
+            self.save_runner_flags();
+            return;
+        }
         if self.flags == self.config.defaults {
             return;
         }
@@ -1571,6 +1652,59 @@ impl App {
                 );
             }
             Err(err) => self.log(LogKind::Error, format!("save failed: {err:#}")),
+        }
+    }
+
+    /// Save the panel's flags as what the runner restarts with. Its ID and the
+    /// directories it was started with are not flags the panel edits.
+    fn save_runner_flags(&mut self) {
+        let Some(target) = self.flag_target.as_mut() else {
+            return;
+        };
+        let mut options = self.flags.to_start_options();
+        options.runner_id = target.spec.options.runner_id.clone();
+        options.extra_dirs = target.spec.options.extra_dirs.clone();
+        if options == target.spec.options {
+            return;
+        }
+        // Such a runner serves no directory, so it never registers with Amp.
+        let serves_other_dirs = target
+            .runner
+            .dirs
+            .iter()
+            .any(|dir| Some(dir) != target.runner.cwd.as_ref());
+        if options.no_serve_cwd
+            && !options.discovers()
+            && options.extra_dirs.is_empty()
+            && !serves_other_dirs
+        {
+            self.flags = StartDefaults::from(&restart_start_options(&target.spec));
+            self.log(
+                LogKind::Error,
+                "not saved: --no-serve-cwd needs --discover-dirs or another directory, or the runner serves nothing",
+            );
+            return;
+        }
+        let spec = LaunchSpec {
+            options,
+            edited: true,
+            ..target.spec.clone()
+        };
+        let id = target.runner.display_id().to_string();
+        match persist_launch_spec(&spec) {
+            Ok(()) => {
+                target.spec = spec;
+                target.dirty = true;
+                self.log(
+                    LogKind::Ok,
+                    format!("saved flags for {id}; restart it to apply them"),
+                );
+            }
+            Err(err) => {
+                // Show what is actually saved, not the change that was lost.
+                self.flags = StartDefaults::from(&restart_start_options(&target.spec));
+                self.log(LogKind::Error, format!("flags not saved: {err:#}"));
+            }
         }
     }
 
@@ -2250,6 +2384,7 @@ mod tests {
                 confirm: None,
                 picker: None,
                 flags: StartDefaults::default(),
+                flag_target: None,
                 flag_field: FlagField::RunnerId,
                 edit: TextInput::default(),
                 log: VecDeque::new(),
@@ -2305,6 +2440,7 @@ mod tests {
                 runner_id: Some(runner.id.clone()),
                 cwd: PathBuf::from("/next"),
                 options: StartOptions::default(),
+                edited: false,
             };
             let action = ConfirmAction::RemoveDir {
                 runner: runner.clone(),
@@ -2362,6 +2498,28 @@ mod tests {
         let saved = Config::load_from(&app.config_path).unwrap().config;
         assert!(saved.defaults.desktop);
         assert!(app.start_options().desktop);
+    }
+
+    #[test]
+    fn a_running_runner_cannot_be_left_serving_nothing() {
+        let (mut app, _, _) = test_app();
+        let mut runner = runner("box", 1);
+        runner.dirs = vec![PathBuf::from("/old")];
+        app.flag_target = Some(FlagTarget {
+            spec: LaunchSpec {
+                runner_id: Some("box".into()),
+                cwd: PathBuf::from("/old"),
+                options: StartOptions::default(),
+                edited: false,
+            },
+            runner,
+            dirty: false,
+        });
+        app.overlay = Overlay::Flags;
+        app.flag_field = FlagField::NoServeCwd;
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.flags.no_serve_cwd);
+        assert!(!app.flag_target.as_ref().unwrap().dirty);
     }
 
     #[test]
@@ -2584,6 +2742,7 @@ mod tests {
                         extra_dirs: vec![tmp.path().join("disappeared-after-confirmation")],
                         ..StartOptions::default()
                     },
+                    edited: false,
                 },
             },
         );
