@@ -252,6 +252,12 @@ fn runner_row(runner: &Runner, width: usize, name_w: usize) -> Line<'static> {
             Style::default().fg(WARN),
         ));
     }
+    if runner.pending.is_some() {
+        parts.push(Span::styled(
+            "↻ restart to apply flags",
+            Style::default().fg(WARN),
+        ));
+    }
     let pid = runner.pid.map(|pid| muted(format!("pid {pid}")));
     let dir = runner.cwd.as_ref().or(runner.dirs.first()).map(|cwd| {
         let more = runner.dirs.iter().filter(|d| *d != cwd).count();
@@ -296,8 +302,9 @@ fn runner_row(runner: &Runner, width: usize, name_w: usize) -> Line<'static> {
 fn draw_detail(frame: &mut Frame, area: Rect, app: &App, runner: &Runner) {
     let focused = app.pane == Pane::Dirs && app.overlay == Overlay::None;
     let flags = runner
-        .launch
+        .pending
         .as_ref()
+        .or(runner.launch.as_ref())
         .map(|opts| flag_rows(&StartDefaults::from(opts)));
     let flag_rows = flags.as_ref().map_or(1, |l| l.len().max(1)) as u16;
     let dir_rows = runner.dirs.len().max(1) as u16;
@@ -322,7 +329,11 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, runner: &Runner) {
 
     draw_dirs(frame, dirs_area, app, runner, focused);
 
-    let block = pane_block(" Launch flags ".into(), false);
+    let mut block = pane_block(" Launch flags ".into(), false);
+    if runner.pending.is_some() {
+        block = block
+            .title(Line::styled(" ↻ restart to apply ", Style::default().fg(WARN)).right_aligned());
+    }
     let inner = padded(block.inner(flags_area));
     frame.render_widget(block, flags_area);
     let body = match flags {
@@ -568,7 +579,7 @@ fn footer_hints(app: &App) -> Vec<Hint> {
                 ("x", "stop", key('x')),
                 ("r", "restart", key('r')),
                 ("a", "add dir", key('a')),
-                ("f", "defaults", key('f')),
+                ("f", "flags", key('f')),
                 ("u", "update amp", key('u')),
                 ("L", "log", key('L')),
                 ("?", "help", key('?')),
@@ -697,8 +708,9 @@ fn help_lines() -> Vec<Line<'static>> {
         section("Runners"),
         row("s", "start a runner in a folder you pick"),
         row("x", "stop the selected runner"),
-        row("r", "restart it with the settings it started with"),
-        row("f", "default flags for new runners"),
+        row("r", "restart it, keeping its flags and directories"),
+        row("f", "change its flags; restarting it applies them"),
+        row("F", "default flags for new runners"),
         Line::from(""),
         section("Directories"),
         row("a", "add a directory to the selected runner"),
@@ -793,14 +805,17 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_flags(frame: &mut Frame, area: Rect, app: &App) {
     let rows = FlagField::ALL.len() as u16;
-    let inner = popup(
-        frame,
-        area,
-        70,
-        rows + 5,
-        "Defaults for new runners",
-        ACCENT,
-    );
+    let (title, note_text) = match &app.flag_target {
+        Some(target) => (
+            format!("Flags for {}", target.runner.display_id()),
+            "Saved as you change them. Restarting the runner applies them.".to_string(),
+        ),
+        None => (
+            "Defaults for new runners".to_string(),
+            format!("Saved to {}", display_path(&app.config_path)),
+        ),
+    };
+    let inner = popup(frame, area, 70, rows + 5, &title, ACCENT);
     set_popup(app, outer_of(inner));
     let [list_area, _, note] = Layout::vertical([
         Constraint::Length(rows),
@@ -842,13 +857,7 @@ fn draw_flags(frame: &mut Frame, area: Rect, app: &App) {
         offset: state.offset(),
         len: FlagField::ALL.len(),
     };
-    frame.render_widget(
-        Paragraph::new(muted(format!(
-            "Saved to {}",
-            display_path(&app.config_path)
-        ))),
-        note,
-    );
+    frame.render_widget(Paragraph::new(muted(note_text)), note);
 }
 
 fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
@@ -990,8 +999,13 @@ fn confirm_text(app: &App, action: &ConfirmAction) -> (&'static str, Color, Stri
             "Restart runner",
             WARN,
             format!(
-                "Restart {} with the settings it was started with? Threads running on it will be interrupted.{}",
+                "Restart {} with {}? Threads running on it will be interrupted.{}",
                 runner.display_id(),
+                if runner.pending.is_some() {
+                    "its new flags"
+                } else {
+                    "the settings it was started with"
+                },
                 if runner.amp_outdated {
                     " It comes back on the updated amp."
                 } else {

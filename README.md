@@ -32,7 +32,8 @@ Once inside, the footer tells you what you can press. The greatest hits:
 | `x` | stop it |
 | `r` | restart it |
 | `a` / `d` | add / remove a directory |
-| `f` | default flags for new runners |
+| `f` | change a runner's flags; restarting it applies them |
+| `F` | default flags for new runners |
 | `u` | update Amp |
 | `U` | update lazyamp |
 | `?` | everything else |
